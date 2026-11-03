@@ -4,7 +4,9 @@
 
 mod common;
 
+use common::framed::Framed;
 use common::*;
+use herdr_core::{holder_proto as proto, wire};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
@@ -49,6 +51,31 @@ impl Drop for Owned {
         }
         self.0.wait().unwrap();
     }
+}
+
+// The test has already stopped its exact Core and keeper. Close the retained
+// private holder directly: ordinary CLI autostart must refuse external custody.
+fn close_private_holder(s: &Session, keeper: i32) {
+    let records = std::fs::read_dir(s.root.join("state/herdr-core/test/keepers")).unwrap();
+    let record: Value = records
+        .map(|entry| serde_json::from_slice::<Value>(&std::fs::read(entry.unwrap().path()).unwrap()).unwrap())
+        .find(|record| record["keeper"]["pid"] == keeper)
+        .unwrap();
+    let mut socket = UnixStream::connect(record["holder"].as_str().unwrap()).unwrap();
+    socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    socket.write_all(&proto::json_frame(proto::HELLO, 0, &proto::Hello { version: proto::VERSION })).unwrap();
+    let (_, _, welcome) = proto::read(&mut socket).unwrap().unwrap();
+    let welcome: proto::Welcome = proto::parse(&welcome).unwrap();
+    for _ in welcome.terminals {
+        assert_eq!(proto::read(&mut socket).unwrap().unwrap().0, proto::TAIL);
+    }
+    socket.write_all(&proto::json_frame(proto::GOODBYE, 0, &proto::Goodbye::Shutdown)).unwrap();
+    while let Some((kind, _, _)) = proto::read(&mut socket).unwrap() {
+        if kind == proto::BYE {
+            return;
+        }
+    }
+    panic!("private holder did not acknowledge shutdown");
 }
 
 #[test]
@@ -201,10 +228,156 @@ fn lost_keeper_fences_native_admission_without_finishing_or_killing_its_program(
     assert_eq!(std::fs::read(state).unwrap(), original, "no fabricated finished record");
     let held = s.program(BIN).args(["serve", "--external-owner"]).output().unwrap();
     assert!(!held.status.success(), "missing recorded keeper is HOLD, never an automatic replacement");
-    // Only this private test's stock owner is used to close its retained program.
     replacement.0.kill().unwrap();
     replacement.0.wait().unwrap();
-    s.json(&["server", "stop"]);
+    close_private_holder(&s, keeper);
+}
+
+#[test]
+fn admitted_partial_and_queued_input_refuse_after_keeper_loss_even_on_another_live_link() {
+    let mut s = Session::new();
+    if let Some(bin) = std::env::var_os("HC_OLD_BIN") {
+        s.bin = bin.into();
+    }
+    let old = s.json(&["server", "status"]);
+    let templates = s.root.join("config/herdr-core/templates");
+    std::fs::create_dir_all(&templates).unwrap();
+    let launch = |name: &str| {
+        let file = s.root.join(name);
+        let command = format!(
+            "python3 -u -c 'import os,tty; tty.setraw(0); print(\"ready\",flush=True); f=open(\"{}\",\"ab\",buffering=0); exec(\"while True: f.write(os.read(0,4096))\")'",
+            file.display()
+        );
+        std::fs::write(
+            templates.join(format!("{name}.md")),
+            format!("---\npaste_gap_ms: 2000\ncommand: {command}\n---\n"),
+        )
+        .unwrap();
+        let result = s.json(&["run", "--bg", name]);
+        let terminal = result["address"].as_str().unwrap().to_string();
+        wait_until("raw program ready", || text(&s, &terminal).contains("ready"));
+        (terminal, file)
+    };
+    let (old_term, old_input) = launch("old-input");
+    let mut replacement = Owned(target(&s, &old).spawn().unwrap());
+    wait_until("target core", || observed_status(&s).is_some_and(|v| v["pid"] == replacement.0.id()));
+    let lost = observed_status(&s).unwrap()["holders"][0]["keeper"]["pid"].as_i64().unwrap() as i32;
+    let (new_term, new_input) = launch("new-input");
+    let status = observed_status(&s).unwrap();
+    let keepers: Vec<i32> =
+        status["holders"].as_array().unwrap().iter().map(|h| h["keeper"]["pid"].as_i64().unwrap() as i32).collect();
+    let mut conn = Framed::open(&s);
+    for (id, method, params) in [
+        (101, "terminal.send", json!({"terminal":old_term,"text":"paste"})),
+        (102, "terminal.send", json!({"terminal":new_term,"text":"other"})),
+    ] {
+        conn.send(
+            0,
+            wire::DATA,
+            json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}).to_string().as_bytes(),
+        );
+    }
+    wait_until("both admitted pastes before Enter", || {
+        std::fs::read(&old_input).unwrap_or_default() == b"paste"
+            && std::fs::read(&new_input).unwrap_or_default() == b"other"
+    });
+    conn.send(
+        0,
+        wire::DATA,
+        json!({"jsonrpc":"2.0","id":103,"method":"terminal.keys","params":{"terminal":old_term,"keys":["x"]}})
+            .to_string()
+            .as_bytes(),
+    );
+    assert!(conn.call("server.status", json!({})).get("error").is_none());
+    assert_eq!(unsafe { libc::kill(lost, libc::SIGKILL) }, 0);
+    wait_until("custody lost", || observed_status(&s).is_some_and(|v| v["keepers_ready"] == false));
+    let mut replies = Vec::new();
+    while replies.len() < 3 {
+        let (channel, kind, bytes) =
+            conn.stash.pop_front().or_else(|| conn.read(Duration::from_secs(8))).expect("input outcome");
+        if channel == 0 && kind == wire::DATA {
+            replies.push(serde_json::from_slice::<Value>(&bytes).unwrap());
+        }
+    }
+    let old_bytes = std::fs::read(&old_input).unwrap();
+    let new_bytes = std::fs::read(&new_input).unwrap();
+    replacement.0.kill().unwrap();
+    replacement.0.wait().unwrap();
+    for keeper in keepers {
+        if keeper != lost {
+            assert_eq!(unsafe { libc::kill(keeper, libc::SIGKILL) }, 0);
+        }
+        close_private_holder(&s, keeper);
+    }
+    for reply in replies {
+        assert!(reply.get("error").is_some(), "admitted input must not claim success after custody loss: {reply}");
+        let hint = reply["error"]["data"]["hint"].as_str().unwrap();
+        assert!(hint.contains(if reply["id"] == 103 { "nothing was typed" } else { "unknown" }), "{reply}");
+    }
+    assert_eq!(old_bytes, b"paste", "no Enter or queued key after loss");
+    assert_eq!(new_bytes, b"other", "global custody fence covers a still-live link");
+}
+
+#[test]
+fn legacy_holder_drains_output_while_native_input_is_under_backpressure() {
+    let mut s = Session::new();
+    if let Some(bin) = std::env::var_os("HC_OLD_BIN") {
+        s.bin = bin.into();
+    }
+    let old = s.json(&["server", "status"]);
+    let trigger = s.root.join("pressure-trigger");
+    let done = s.root.join("pressure-done");
+    let code = r#"
+import os,sys,tty,threading,json
+fifo,done=sys.argv[1:]
+tty.setraw(0); os.mkfifo(fifo); print('ready-pressure',flush=True)
+with open(fifo) as f: f.read()
+def output():
+ for _ in range(1024):
+  data=b'output-pressure '*1024+b'\r\n'
+  while data: data=data[os.write(1,data):]
+writer=threading.Thread(target=output); writer.start()
+total=0; valid=True
+while total < 4*1024*1024:
+ data=os.read(0,65536); total+=len(data); valid=valid and data==b'x'*len(data)
+writer.join(); open(done,'w').write(json.dumps({'bytes':total,'valid':valid}))
+while True: os.read(0,4096)
+"#;
+    let terminal = run(&s, &["python3", "-u", "-c", code, trigger.to_str().unwrap(), done.to_str().unwrap()]);
+    wait_until("pressure program ready", || text(&s, &terminal).contains("ready-pressure"));
+    let mut replacement = Owned(target(&s, &old).spawn().unwrap());
+    wait_until("target core", || observed_status(&s).is_some_and(|v| v["pid"] == replacement.0.id()));
+    let before = observed_status(&s).unwrap();
+    let keeper = before["holders"][0]["keeper"]["pid"].as_i64().unwrap() as i32;
+    let mut viewer = common::framed::Viewer::attach(&s, &terminal, 44, 46, json!({}));
+    assert_eq!(unsafe { libc::kill(keeper, libc::SIGSTOP) }, 0);
+    for _ in 0..128 {
+        viewer.typed(&vec![b'x'; 32768]);
+    }
+    assert!(viewer.conn.call("server.status", json!({})).get("error").is_none());
+    assert_eq!(unsafe { libc::kill(replacement.0.id() as i32, libc::SIGSTOP) }, 0);
+    std::fs::write(&trigger, b"go").unwrap();
+    assert_eq!(unsafe { libc::kill(keeper, libc::SIGCONT) }, 0);
+    // Hold the output consumer long enough to fill both private socket paths.
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(unsafe { libc::kill(replacement.0.id() as i32, libc::SIGCONT) }, 0);
+    let started = std::time::Instant::now();
+    while !done.exists() && started.elapsed() < Duration::from_secs(15) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let receipt = std::fs::read(&done).ok().map(|bytes| serde_json::from_slice::<Value>(&bytes).unwrap());
+    let after = observed_status(&s);
+    drop(viewer);
+    replacement.0.kill().unwrap();
+    replacement.0.wait().unwrap();
+    assert_eq!(unsafe { libc::kill(keeper, libc::SIGKILL) }, 0);
+    close_private_holder(&s, keeper);
+    assert_eq!(
+        receipt,
+        Some(json!({"bytes":4*1024*1024,"valid":true})),
+        "concurrent holder output and input must both settle"
+    );
+    assert_eq!(after.unwrap()["keepers_ready"], true, "pressure must not fabricate custody loss");
 }
 
 #[test]

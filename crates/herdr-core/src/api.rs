@@ -458,6 +458,7 @@ async fn terminal_send(core: Ctx<'_>, p: SendParams) -> Result<SendResult, RpcEr
     } else {
         None
     };
+    core.input_custody(&core.lock(), true)?;
     Ok(SendResult { status: sent.status, turn: sent.turn, started: sent.started, wait })
 }
 

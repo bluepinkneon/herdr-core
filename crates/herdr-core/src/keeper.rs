@@ -28,6 +28,107 @@ pub struct KeeperInfo {
     pub socket: PathBuf,
 }
 
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_old_reader_failure_cannot_retire_the_replacement_lease_or_pump_epoch() {
+        let root = PathBuf::from(format!("/var/tmp/hc-keeper-race-{}", platform::random_hex()));
+        let paths = Paths {
+            state: root.join("state"),
+            config: root.join("config"),
+            socket: root.join("core.sock"),
+            holder_socket: root.join("core.holder.sock"),
+        };
+        paths.create_dirs().unwrap();
+        File::create(paths.state.join("core.lock")).unwrap();
+        std::fs::create_dir(paths.state.join("keepers")).unwrap();
+        let record = Record {
+            holder: paths.holder_socket.clone(),
+            keeper: KeeperInfo {
+                pid: std::process::id(),
+                birth: "private".into(),
+                instance: "keeper".into(),
+                socket: root.join("keeper.sock"),
+            },
+            state: "active".into(),
+            error: None,
+        };
+        let keeper = Arc::new(Keeper {
+            paths,
+            state: Mutex::new(State {
+                owner: None,
+                downstream: None,
+                writing: false,
+                epoch: 1,
+                lease: 1,
+                previous: "none".into(),
+                terms: HashSet::new(),
+                draining: false,
+                goodbye: None,
+                record,
+            }),
+            settled: Condvar::new(),
+        });
+        for pump in [false, true] {
+            let (captured, ready) = std::sync::mpsc::channel();
+            let (release, resumed) = std::sync::mpsc::channel();
+            let reader = keeper.clone();
+            let failed = std::thread::spawn(move || {
+                let expected = {
+                    let st = reader.lock();
+                    if pump { st.epoch } else { st.lease }
+                };
+                captured.send(expected).unwrap();
+                resumed.recv().unwrap();
+                reader
+                    .fail(if pump { Failure::Epoch(expected) } else { Failure::Lease(expected) }, &"old stream failed");
+            });
+            let old = ready.recv().unwrap();
+            let (stream, mut peer) = Stream::pair().unwrap();
+            let lock = platform::handover::open_lock(&keeper.paths.state.join("core.lock")).unwrap();
+            assert!(platform::handover::try_lock(&lock).unwrap());
+            {
+                let mut st = keeper.lock();
+                st.lease = old + 1;
+                st.epoch = old + 1;
+                st.owner = Some(Owner {
+                    lease: st.lease,
+                    ready: true,
+                    handover: false,
+                    pid: std::process::id(),
+                    birth: "new".into(),
+                    _lock: lock,
+                    stream,
+                });
+                keeper.save(&st).unwrap();
+            }
+            release.send(()).unwrap();
+            failed.join().unwrap();
+            let st = keeper.lock();
+            assert_eq!(st.record.state, "active", "stale failure must not mutate current custody");
+            assert_eq!(st.owner.as_ref().unwrap().lease, old + 1);
+            (&st.owner.as_ref().unwrap().stream).write_all(b"new").unwrap();
+            let mut bytes = [0; 3];
+            peer.read_exact(&mut bytes).unwrap();
+            assert_eq!(&bytes, b"new");
+            let probe = platform::handover::open_lock(&keeper.paths.state.join("core.lock")).unwrap();
+            assert!(!platform::handover::try_lock(&probe).unwrap(), "replacement still owns the lock");
+            drop(st);
+            keeper.fail(if pump { Failure::Epoch(old + 1) } else { Failure::Lease(old + 1) }, &"current stream failed");
+            let mut st = keeper.lock();
+            assert_eq!(st.record.state, "failed", "current failure must still fence custody");
+            assert!(st.owner.is_none());
+            assert!(platform::handover::try_lock(&probe).unwrap());
+            st.record.state = "active".into();
+            st.record.error = None;
+        }
+        drop(keeper);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct Record {
     holder: PathBuf,
@@ -160,6 +261,8 @@ struct Owner {
 struct State {
     owner: Option<Owner>,
     downstream: Option<Stream>,
+    /// A write retains its own lock FD even if the owner dies meanwhile.
+    writing: bool,
     epoch: u64,
     lease: u64,
     previous: String,
@@ -172,6 +275,11 @@ struct Keeper {
     paths: Paths,
     state: Mutex<State>,
     settled: Condvar,
+}
+
+enum Failure {
+    Lease(u64),
+    Epoch(u64),
 }
 
 pub fn run(holder: PathBuf) -> io::Result<()> {
@@ -206,6 +314,7 @@ pub fn run(holder: PathBuf) -> io::Result<()> {
         state: Mutex::new(State {
             owner: None,
             downstream: None,
+            writing: false,
             epoch: 0,
             lease: 0,
             previous: "none".into(),
@@ -239,6 +348,10 @@ impl Keeper {
 
     fn detach(&self, lease: u64, previous: &str) {
         let mut st = self.lock();
+        self.detach_locked(&mut st, lease, previous);
+    }
+
+    fn detach_locked(&self, st: &mut State, lease: u64, previous: &str) {
         if st.owner.as_ref().is_none_or(|owner| owner.lease != lease) {
             return;
         }
@@ -259,17 +372,24 @@ impl Keeper {
         self.settled.notify_all();
     }
 
-    fn fail(&self, error: &dyn std::fmt::Display) {
-        {
-            let mut st = self.lock();
-            st.record.state = "failed".into();
-            st.record.error = Some(error.to_string());
-            if let Err(error) = self.save(&st) {
-                eprintln!("keeper cannot record failure: {error}");
-            }
+    fn fail(&self, expected: Failure, error: &dyn std::fmt::Display) {
+        self.fail_locked(&mut self.lock(), expected, error);
+    }
+
+    fn fail_locked(&self, st: &mut State, expected: Failure, error: &dyn std::fmt::Display) {
+        let current = match expected {
+            Failure::Lease(lease) => st.lease == lease && (st.owner.is_some() || st.writing),
+            Failure::Epoch(epoch) => st.epoch == epoch,
+        };
+        if !current {
+            return;
         }
-        let lease = self.lock().lease;
-        self.detach(lease, "crash");
+        st.record.state = "failed".into();
+        st.record.error = Some(error.to_string());
+        if let Err(error) = self.save(st) {
+            eprintln!("keeper cannot record failure: {error}");
+        }
+        self.detach_locked(st, st.lease, "crash");
     }
 
     fn serve(self: &Arc<Self>, mut stream: Stream) -> io::Result<()> {
@@ -278,13 +398,15 @@ impl Keeper {
         let (kind, descriptor) = platform::keeper::receive(&stream)?;
         if kind == b'Q' && descriptor.is_none() {
             let mut st = self.lock();
-            if let Some(owner) = &st.owner {
-                if platform::keeper::same_process_alive(owner.pid, &owner.birth)? {
-                    return Err(io::Error::other("keeper still has a live native owner"));
-                }
+            if let Some(owner) = &st.owner
+                && platform::keeper::same_process_alive(owner.pid, &owner.birth)?
+            {
+                return Err(io::Error::other("keeper still has a live native owner"));
+            }
+            if st.owner.is_some() || st.writing {
                 let (next, cap) = self
                     .settled
-                    .wait_timeout_while(st, LIMIT, |st| st.owner.is_some())
+                    .wait_timeout_while(st, LIMIT, |st| st.owner.is_some() || st.writing)
                     .map_err(|error| io::Error::other(error.to_string()))?;
                 st = next;
                 if cap.timed_out() {
@@ -313,7 +435,7 @@ impl Keeper {
         }
         let lease = {
             let mut st = self.lock();
-            if st.owner.is_some() || st.record.state != "active" {
+            if st.owner.is_some() || st.writing || st.record.state != "active" {
                 return Err(io::Error::other("keeper not available for adoption"));
             }
             st.lease += 1;
@@ -332,29 +454,9 @@ impl Keeper {
         let result = self.attach(&mut stream).and_then(|_| {
             stream.set_read_timeout(None)?;
             while let Some((kind, id, payload)) = proto::read(&mut stream)? {
-                let mut st = self.lock();
-                if st.owner.as_ref().is_none_or(|owner| owner.lease != lease) {
-                    break;
-                }
-                if kind == proto::HELLO {
-                    return Err(io::Error::other("second HELLO is not admitted"));
-                }
-                if kind == proto::DRAIN {
-                    st.draining = true;
-                }
-                if kind == proto::GOODBYE {
-                    st.goodbye = Some(proto::parse(&payload)?);
-                }
-                st.downstream
-                    .as_mut()
-                    .ok_or_else(|| io::Error::other("holder connection absent"))?
-                    .write_all(&proto::frame(kind, id, &payload))?;
-                if kind == proto::RELEASE {
-                    st.terms.remove(&id);
-                }
+                self.forward(lease, kind, id, &payload)?;
                 // No further command may cross a requested handover/stop.
                 if kind == proto::GOODBYE {
-                    drop(st);
                     let mut byte = [0];
                     let _ = std::io::Read::read(&mut stream, &mut byte);
                     return Ok(());
@@ -362,13 +464,50 @@ impl Keeper {
             }
             Ok(())
         });
-        if let Err(error) = &result
-            && self.lock().lease == lease
-        {
-            self.fail(error);
+        if let Err(error) = &result {
+            self.fail(Failure::Lease(lease), error);
         }
         // A BYE path already settled its observed handover; don't overwrite it.
         self.detach(lease, "crash");
+        result
+    }
+
+    fn forward(&self, lease: u64, kind: u8, id: u32, payload: &[u8]) -> io::Result<()> {
+        let (lock, mut downstream) = {
+            let mut st = self.lock();
+            let owner = st
+                .owner
+                .as_ref()
+                .filter(|owner| owner.lease == lease)
+                .ok_or_else(|| io::Error::other("native owner changed"))?;
+            if st.record.state != "active" || st.writing || kind == proto::HELLO {
+                return Err(io::Error::other("keeper command not admitted"));
+            }
+            let lock = owner._lock.try_clone()?;
+            let downstream =
+                st.downstream.as_ref().ok_or_else(|| io::Error::other("holder connection absent"))?.try_clone()?;
+            if kind == proto::DRAIN {
+                st.draining = true;
+            }
+            if kind == proto::GOODBYE {
+                st.goodbye = Some(proto::parse(payload)?);
+            }
+            st.writing = true;
+            (lock, downstream)
+        };
+        // The holder writes OUTPUT under its own mutex. Never block its input
+        // socket while holding ours: the pump must remain able to drain it.
+        // This duplicate OFD prevents replacement HELLO until this write settles.
+        let result = downstream.write_all(&proto::frame(kind, id, payload));
+        let mut st = self.lock();
+        if let Err(error) = &result {
+            self.fail_locked(&mut st, Failure::Lease(lease), error);
+        } else if kind == proto::RELEASE {
+            st.terms.remove(&id);
+        }
+        st.writing = false;
+        drop(lock);
+        self.settled.notify_all();
         result
     }
 
@@ -493,7 +632,7 @@ impl Keeper {
                         if let Some((_, mut upstream)) = upstream {
                             let _ = upstream.write_all(&proto::frame(proto::BYE, 0, &[]));
                         }
-                        self.retire()?;
+                        self.retire(epoch)?;
                     }
                     return Err(io::Error::other("unrequested holder BYE"));
                 }
@@ -511,19 +650,20 @@ impl Keeper {
             }
             if st.draining && st.terms.is_empty() {
                 drop(st);
-                self.retire()?;
+                self.retire(epoch)?;
             }
             Err(io::Error::other("holder stream lost; effects and programs are not declared ended"))
         })();
-        if let Err(error) = result
-            && self.lock().epoch == epoch
-        {
-            self.fail(&error);
+        if let Err(error) = result {
+            self.fail(Failure::Epoch(epoch), &error);
         }
     }
 
-    fn retire(&self) -> io::Result<()> {
+    fn retire(&self, epoch: u64) -> io::Result<()> {
         let mut st = self.lock();
+        if st.epoch != epoch {
+            return Ok(());
+        }
         st.record.state = "retired".into();
         self.save(&st)?;
         platform::remove_endpoint(&st.record.keeper.socket);
