@@ -19,17 +19,24 @@ type Writer = platform::AsyncWrite;
 pub fn serve() -> io::Result<()> {
     let paths = Paths::from_env().map_err(|e| io::Error::other(e.message))?;
     paths.create_dirs()?;
-    let mut lock =
+    let lock =
         std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(paths.state.join("core.lock"))?;
     // Someone else holds the lock: they serve (or are handing over to whoever
     // starts the next core). Waiting here would start an unwanted core after a stop.
     if !platform::try_lock(&lock) {
         return Ok(());
     }
+    let info = load_identity(&paths.state, platform::machine_id())?;
+    serve_locked(paths, lock, info)
+}
+
+/// The foreground handover launcher transfers its exact lock into the server;
+/// releasing and reopening it here would admit a competing holder's core.
+pub(crate) fn serve_locked(paths: Paths, mut lock: std::fs::File, info: CoreInfo) -> io::Result<()> {
     // Where we listen, for clients whose env points elsewhere.
     lock.set_len(0)?;
+    io::Seek::rewind(&mut lock)?;
     io::Write::write_all(&mut lock, paths.socket.as_os_str().as_encoded_bytes())?;
-    let info = load_identity(&paths.state, platform::machine_id())?;
     let socket = paths.socket.clone();
     let _shutdown_watch = platform::monitor_host_shutdown();
     // Adopt the holder's terminals before anyone can talk to us.
@@ -83,6 +90,16 @@ struct Identity {
     info: CoreInfo,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     machine_id: Option<String>,
+}
+
+/// Unlike ordinary startup, a handover must never create or reset an identity.
+pub(crate) fn handover_identity(bytes: &[u8], expected: &str) -> io::Result<CoreInfo> {
+    let saved: Identity = serde_json::from_slice(bytes).map_err(io::Error::other)?;
+    let machine = platform::machine_id();
+    if saved.info.id != expected || (saved.machine_id.is_some() && machine.is_some() && saved.machine_id != machine) {
+        return Err(io::Error::other("handover state identity does not match this core and machine"));
+    }
+    Ok(saved.info)
 }
 
 /// What a copy of another machine's disk must not bring along: that

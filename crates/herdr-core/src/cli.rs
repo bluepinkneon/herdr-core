@@ -106,7 +106,7 @@ enum Cmd {
         session: Option<String>,
     },
     #[command(hide = true)]
-    Serve,
+    Serve(crate::handover::ServeArgs),
     #[command(hide = true)]
     Hold {
         #[arg(long)]
@@ -335,8 +335,8 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
     let pick = |given: String| target((!given.is_empty()).then_some(given));
     let pick_finished = |given: String| crate::cli::target(&paths, (!given.is_empty()).then_some(given), json, true);
     Ok(Some(match cmd {
-        Cmd::Serve => {
-            crate::server::serve().map_err(|e| RpcError::internal(e.to_string()))?;
+        Cmd::Serve(args) => {
+            crate::handover::serve(args).map_err(|e| RpcError::internal(e.to_string()))?;
             return Ok(None);
         }
         Cmd::Hold { socket } => {

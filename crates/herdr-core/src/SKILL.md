@@ -116,6 +116,21 @@ Custom `0.1.15-source.1` also supports native scrolling through `terminal.scroll
 on the same framed attachment (see `schema/README.md`). It does not extend
 keyboard quiet. Native wheel input requires explicit `scroll_input`; an
 observer still cannot type or resize. Lost scroll replies must not be retried.
+
+For an already authorized Linux/Darwin service-owner upgrade, the replacement
+can run in its owner's main PID with `hc serve --handover-core-id ID
+--handover-pid PID --handover-version VERSION`. This requires the same
+`HC_SESSION`, state root and socket as the still-running predecessor. Optional
+`--handover-birth TOKEN` checks Linux `/proc/PID/stat` starttime ticks or Darwin
+`proc_bsdinfo` start seconds:microseconds. Native code verifies the socket peer,
+birth and saved identity, sends **one** restart, waits for kernel-observed old
+exit, then adopts under the same session lock without detaching. A missing or
+mismatched reply, competing owner or failed observation exits nonzero: hold
+the original operation; never retry the restart. Requests have a 15-second
+safety cap and old exit a 60-second cap. Existing programs are not killed.
+The service owner must preserve the old holders' process groups/cgroups;
+native handover alone cannot prevent OS cleanup of an old service's children.
+
 `hc put <t> <file>` sends a file beside a terminal and prints its destination.
 `hc label <t> key=value` adds labels.
 
