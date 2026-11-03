@@ -12,6 +12,7 @@ mod handover;
 pub mod holder;
 pub mod holder_proto;
 pub mod input;
+pub mod keeper;
 mod kept;
 pub mod keys;
 pub mod locale;

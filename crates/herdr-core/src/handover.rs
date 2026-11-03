@@ -7,6 +7,9 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 
 #[derive(clap::Args)]
 pub(crate) struct ServeArgs {
+    /// The OS owner alone restarts this daemon; native keepers retain holder links.
+    #[arg(long)]
+    external_owner: bool,
     /// Exact existing core identity; all three handover fields are required together.
     #[arg(long, requires_all = ["handover_pid", "handover_version"])]
     handover_core_id: Option<String>,
@@ -20,7 +23,7 @@ pub(crate) struct ServeArgs {
 }
 
 pub(crate) fn serve(args: ServeArgs) -> io::Result<()> {
-    let Some(expected) = args.handover_core_id else { return server::serve() };
+    let Some(expected) = args.handover_core_id else { return server::serve_external(args.external_owner) };
     let pid = args.handover_pid.expect("clap requires the pid");
     let version = args.handover_version.expect("clap requires the version");
     let paths = Paths::from_env().map_err(|e| io::Error::other(e.message))?;
@@ -44,6 +47,9 @@ pub(crate) fn serve(args: ServeArgs) -> io::Result<()> {
     if status["core"]["id"] != expected || status["pid"] != pid || status["version"] != version {
         return Err(io::Error::other("handover predecessor core/PID/version mismatch; restart not sent"));
     }
+    if status["external_owner"] == true && status["keepers_ready"] != true {
+        return Err(io::Error::other("handover keeper custody unavailable; restart not sent"));
+    }
     platform::handover::same_lock(&lock, &lock_path)?;
     if std::fs::read(&identity_path)? != identity_bytes {
         return Err(io::Error::other("handover saved identity changed; restart not sent"));
@@ -58,6 +64,7 @@ pub(crate) fn serve(args: ServeArgs) -> io::Result<()> {
     drop(reader);
     drop(stream);
     process.wait()?;
+    crate::keeper::settle(&paths)?;
     // Any competing owner holds instead of being adopted or restarted. This
     // exact file handle stays locked through Core::start and the serving loop.
     if !platform::handover::try_lock(&lock)? {
@@ -67,7 +74,7 @@ pub(crate) fn serve(args: ServeArgs) -> io::Result<()> {
     if std::fs::read(identity_path)? != identity_bytes {
         return Err(io::Error::other("handover adoption held: saved identity changed"));
     }
-    server::serve_locked(paths, lock, info)
+    server::serve_locked(paths, lock, info, true)
 }
 
 /// Bounded, correlated replies on the one existing connection. A malformed,

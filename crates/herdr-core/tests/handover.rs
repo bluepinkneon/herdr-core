@@ -88,6 +88,191 @@ fn replacement_serves_in_its_owner_pid_and_preserves_programs_without_caller_pro
 }
 
 #[test]
+fn externally_owned_recovery_drains_stock_holder_while_the_owner_is_absent() {
+    let mut s = Session::new();
+    if let Some(bin) = std::env::var_os("HC_OLD_BIN") {
+        s.bin = bin.into();
+    }
+    let old = s.json(&["server", "status"]);
+    let trigger = s.root.join("trigger");
+    let completed = s.root.join("drained");
+    let effects = s.root.join("effects");
+    let code = "import os,sys\nfifo,done,effects=sys.argv[1:]\nos.mkfifo(fifo)\nprint('original',flush=True)\nwith open(fifo) as f: f.read()\nfor n in range(140000): print('retained-output-%06d'%n)\nsys.stdout.flush()\nopen(done,'w').write('complete')\nfor line in sys.stdin:\n with open(effects,'a') as f: f.write(line)\n print('once-'+line.strip(),flush=True)";
+    let terminal = run(
+        &s,
+        &[
+            "python3",
+            "-u",
+            "-c",
+            code,
+            trigger.to_str().unwrap(),
+            completed.to_str().unwrap(),
+            effects.to_str().unwrap(),
+        ],
+    );
+    wait_until("original program", || text(&s, &terminal).contains("original"));
+    let program = get(&s, &terminal)["pid"].clone();
+    let mut replacement = Owned(target(&s, &old).spawn().unwrap());
+    wait_until("target owns session", || observed_status(&s).is_some_and(|v| v["pid"] == replacement.0.id()));
+    replacement.0.kill().unwrap();
+    replacement.0.wait().unwrap();
+    // No Source progress or native restart request occurs in this interval.
+    std::fs::OpenOptions::new().write(true).open(&trigger).unwrap().write_all(b"go").unwrap();
+    std::thread::sleep(Duration::from_secs(4));
+    assert!(observed_status(&s).is_none(), "old holder must not auto-launch any core");
+    wait_until("holder drains beyond socket capacity without core", || completed.exists());
+    let resumed = Owned(
+        s.program(BIN)
+            .args(["serve", "--external-owner"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    wait_until("same-PID external recovery", || observed_status(&s).is_some_and(|v| v["pid"] == resumed.0.id()));
+    assert_eq!(get(&s, &terminal)["pid"], program);
+    assert!(text(&s, &terminal).contains("retained-output-139999"), "native holder tail is the recovery source");
+    let status = observed_status(&s).unwrap();
+    let keeper = &status["holders"][0]["keeper"];
+    assert!(keeper["pid"].as_u64().is_some());
+    assert!(!keeper["birth"].as_str().unwrap().is_empty());
+    s.bin = BIN.into();
+    s.json(&["send", &terminal, "fresh"]);
+    wait_until("fresh once-only input", || std::fs::read_to_string(&effects).is_ok_and(|v| v == "fresh\n"));
+    s.connect().call(6, "server.stop", json!({}));
+    drop(resumed);
+}
+
+#[test]
+fn external_handover_preserves_saved_screen_and_rejects_unowned_keeper_attach() {
+    let s = Session::new();
+    let first = Owned(
+        s.cmd().args(["serve", "--external-owner"]).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap(),
+    );
+    wait_until("external core", || s.connect_ok());
+    let terminal = run(&s, &["sh", "-c", "echo saved-screen; while read line; do echo got-$line; done"]);
+    wait_until("saved screen", || text(&s, &terminal).contains("saved-screen"));
+    let before = observed_status(&s).unwrap();
+    let keeper = &before["holders"][0]["keeper"];
+    let mut intruder = UnixStream::connect(keeper["socket"].as_str().unwrap()).unwrap();
+    intruder.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    intruder.write_all(b"A").unwrap();
+    let mut byte = [0];
+    assert_eq!(intruder.read(&mut byte).unwrap(), 0, "no descriptor cannot steal the holder");
+    let competing = s.cmd().args(["serve", "--external-owner"]).output().unwrap();
+    assert!(!competing.status.success(), "live owner must refuse without releasing its lock");
+    assert_eq!(observed_status(&s).unwrap()["pid"], first.0.id());
+    let second = Owned(target(&s, &before).spawn().unwrap());
+    wait_until("planned external handover", || observed_status(&s).is_some_and(|v| v["pid"] == second.0.id()));
+    let after = observed_status(&s).unwrap();
+    assert_eq!(after["holders"][0]["keeper"], *keeper, "same keeper, not a new history owner");
+    assert!(text(&s, &terminal).contains("saved-screen"));
+    s.json(&["send", &terminal, "new"]);
+    wait_until("one new input after planned handover", || text(&s, &terminal).contains("got-new"));
+    s.connect().call(8, "server.stop", json!({}));
+    drop(second);
+}
+
+#[test]
+fn lost_keeper_fences_native_admission_without_finishing_or_killing_its_program() {
+    let mut s = Session::new();
+    if let Some(bin) = std::env::var_os("HC_OLD_BIN") {
+        s.bin = bin.into();
+    }
+    let old = s.json(&["server", "status"]);
+    let terminal = run(&s, &["sh", "-c", "echo preserved; while read line; do echo got-$line; done"]);
+    wait_until("original program", || text(&s, &terminal).contains("preserved"));
+    let program = get(&s, &terminal)["pid"].as_i64().unwrap() as i32;
+    let mut replacement = Owned(target(&s, &old).spawn().unwrap());
+    wait_until("target core", || observed_status(&s).is_some_and(|v| v["pid"] == replacement.0.id()));
+    let status = observed_status(&s).unwrap();
+    let keeper = status["holders"][0]["keeper"]["pid"].as_i64().unwrap() as i32;
+    let state = s.root.join("state/herdr-core/test/terminals.json");
+    let original = std::fs::read(&state).unwrap();
+    assert_eq!(unsafe { libc::kill(keeper, libc::SIGKILL) }, 0);
+    wait_until("native reports keeper loss", || observed_status(&s).is_some_and(|v| v["keepers_ready"] == false));
+    std::thread::sleep(Duration::from_secs(4));
+    assert!(replacement.0.try_wait().unwrap().is_none(), "native keeps its lock; old stock cannot replace it");
+    assert_eq!(observed_status(&s).unwrap()["pid"], replacement.0.id());
+    assert!(
+        s.connect().call(9, "terminal.send", json!({"terminal":terminal,"text":"must-not-run"})).get("error").is_some()
+    );
+    assert_eq!(unsafe { libc::kill(program, 0) }, 0, "no invented holder-lost program cleanup");
+    assert_eq!(std::fs::read(state).unwrap(), original, "no fabricated finished record");
+    let held = s.program(BIN).args(["serve", "--external-owner"]).output().unwrap();
+    assert!(!held.status.success(), "missing recorded keeper is HOLD, never an automatic replacement");
+    // Only this private test's stock owner is used to close its retained program.
+    replacement.0.kill().unwrap();
+    replacement.0.wait().unwrap();
+    s.json(&["server", "stop"]);
+}
+
+#[test]
+fn future_start_waits_for_exact_keeper_settlement_and_preserves_external_mode() {
+    let s = Session::new();
+    let initial = s.json(&["server", "start", "--external-owner"]);
+    assert_eq!(initial["external_owner"], true);
+    let terminal = run(&s, &["sh", "-c", "echo awake; while read line; do echo got-$line; done"]);
+    wait_until("original output", || text(&s, &terminal).contains("awake"));
+    let status = observed_status(&s).unwrap();
+    let keeper = status["holders"][0]["keeper"]["pid"].as_i64().unwrap() as i32;
+    let core = status["pid"].as_i64().unwrap() as i32;
+    assert_eq!(unsafe { libc::kill(keeper, libc::SIGSTOP) }, 0);
+    assert_eq!(unsafe { libc::kill(core, libc::SIGKILL) }, 0);
+    let mut recovery = s
+        .cmd()
+        .args(["server", "start", "--external-owner", "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        recovery.try_wait().unwrap().is_none(),
+        "exact held keeper lock must settle, not become a permanent refusal"
+    );
+    assert_eq!(unsafe { libc::kill(keeper, libc::SIGCONT) }, 0);
+    let output = recovery.wait_with_output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let resumed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(resumed["external_owner"], true);
+    assert_eq!(resumed["keepers_ready"], true);
+    assert_eq!(resumed["holders"][0]["keeper"], status["holders"][0]["keeper"]);
+    s.json(&["send", &terminal, "fresh"]);
+    wait_until("same program after exact settlement", || text(&s, &terminal).contains("got-fresh"));
+    s.connect().call(9, "server.stop", json!({}));
+}
+
+#[test]
+fn delayed_holder_bye_settles_after_the_old_core_has_exited() {
+    let s = Session::new();
+    let mut first = Owned(
+        s.cmd().args(["serve", "--external-owner"]).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap(),
+    );
+    wait_until("external core", || s.connect_ok());
+    let terminal = run(&s, &["sh", "-c", "echo saved-before-stop; while read line; do echo got-$line; done"]);
+    wait_until("saved screen", || text(&s, &terminal).contains("saved-before-stop"));
+    let before = observed_status(&s).unwrap();
+    let holder = before["holders"][0]["pid"].as_i64().unwrap() as i32;
+    assert_eq!(unsafe { libc::kill(holder, libc::SIGSTOP) }, 0);
+    let reply = s.connect().call(1, "server.restart", json!({}));
+    assert_eq!(reply["result"]["stopped"], true);
+    // Core's existing bounded goodbye ends before this stopped holder answers.
+    assert!(first.0.wait().unwrap().success());
+    let lock = std::fs::File::open(s.root.join("state/herdr-core/test/core.lock")).unwrap();
+    assert_ne!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+    assert_eq!(unsafe { libc::kill(holder, libc::SIGCONT) }, 0);
+    let output = s.cmd().args(["server", "start", "--external-owner", "--json"]).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let after: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(after["holders"][0]["keeper"], before["holders"][0]["keeper"]);
+    assert!(text(&s, &terminal).contains("saved-before-stop"));
+    s.json(&["send", &terminal, "fresh"]);
+    wait_until("same program after late BYE", || text(&s, &terminal).contains("got-fresh"));
+    s.connect().call(2, "server.stop", json!({}));
+}
+
+#[test]
 fn mismatched_identity_birth_or_state_refuses_without_restarting_the_old_core() {
     let s = Session::new();
     let old = s.json(&["server", "status"]);

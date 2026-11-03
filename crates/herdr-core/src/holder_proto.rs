@@ -84,6 +84,8 @@ pub struct Welcome {
     /// How the previous core left: "none", "handover" or "crash".
     pub previous: String,
     pub terminals: Vec<HeldTerminal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keeper: Option<crate::keeper::KeeperInfo>,
 }
 
 /// One terminal the holder runs; a `TAIL` frame with its recent output follows the welcome.

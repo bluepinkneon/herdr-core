@@ -3,6 +3,7 @@
 //! Everything above it is shared.
 
 pub(crate) mod handover;
+pub(crate) mod keeper;
 
 #[cfg(unix)]
 mod unix;

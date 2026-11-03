@@ -341,6 +341,16 @@
           "instance": {
             "type": "string"
           },
+          "keeper": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/KeeperInfo"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "pid": {
             "format": "uint32",
             "minimum": 0,
@@ -382,6 +392,31 @@
         "required": [
           "outcome",
           "key"
+        ],
+        "type": "object"
+      },
+      "KeeperInfo": {
+        "properties": {
+          "birth": {
+            "type": "string"
+          },
+          "instance": {
+            "type": "string"
+          },
+          "pid": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "socket": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "pid",
+          "birth",
+          "instance",
+          "socket"
         ],
         "type": "object"
       },
@@ -995,6 +1030,10 @@
           "core": {
             "$ref": "#/components/schemas/CoreInfo"
           },
+          "external_owner": {
+            "description": "Daemon restarts belong to the external OS owner, never a holder.",
+            "type": "boolean"
+          },
           "finished": {
             "format": "uint",
             "minimum": 0,
@@ -1025,6 +1064,10 @@
               "null"
             ]
           },
+          "keepers_ready": {
+            "description": "False after a keeper link is lost; native admission is held while its owner stays alive.",
+            "type": "boolean"
+          },
           "live": {
             "format": "uint",
             "minimum": 0,
@@ -1045,6 +1088,8 @@
           }
         },
         "required": [
+          "external_owner",
+          "keepers_ready",
           "core",
           "version",
           "pid",

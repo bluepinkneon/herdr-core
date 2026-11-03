@@ -80,7 +80,7 @@ fn owned_fd(fd: i32) -> io::Result<File> {
 }
 
 #[cfg(target_os = "linux")]
-fn peer_pid(stream: &Stream) -> io::Result<u32> {
+pub fn peer_pid(stream: &Stream) -> io::Result<u32> {
     let mut peer: libc::ucred = unsafe { std::mem::zeroed() };
     let mut size = std::mem::size_of_val(&peer) as libc::socklen_t;
     if unsafe {
@@ -96,7 +96,7 @@ fn peer_pid(stream: &Stream) -> io::Result<u32> {
 }
 
 #[cfg(target_os = "macos")]
-fn peer_pid(stream: &Stream) -> io::Result<u32> {
+pub fn peer_pid(stream: &Stream) -> io::Result<u32> {
     let mut pid: libc::pid_t = 0;
     let mut size = std::mem::size_of_val(&pid) as libc::socklen_t;
     if unsafe {
@@ -112,7 +112,7 @@ fn peer_pid(stream: &Stream) -> io::Result<u32> {
 }
 
 #[cfg(target_os = "linux")]
-fn birth(pid: u32) -> io::Result<String> {
+pub fn birth(pid: u32) -> io::Result<String> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
     let (_, fields) = stat.rsplit_once(')').ok_or_else(|| io::Error::other("unreadable process stat"))?;
     let fields: Vec<_> = fields.split_whitespace().collect();
@@ -128,7 +128,7 @@ fn birth(pid: u32) -> io::Result<String> {
 }
 
 #[cfg(target_os = "macos")]
-fn birth(pid: u32) -> io::Result<String> {
+pub fn birth(pid: u32) -> io::Result<String> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of_val(&info) as i32;
     if unsafe { libc::proc_pidinfo(pid as i32, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) } != size {
@@ -143,6 +143,19 @@ fn birth(pid: u32) -> io::Result<String> {
 #[cfg(target_os = "linux")]
 fn watch(pid: u32) -> io::Result<File> {
     owned_fd(unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) } as i32)
+}
+
+pub fn same_process_alive(pid: u32, expected_birth: &str) -> io::Result<bool> {
+    let event = match watch(pid) {
+        Ok(event) => event,
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    match exited(&event, Duration::ZERO) {
+        Ok(()) => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::TimedOut => Ok(birth(pid)? == expected_birth),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(target_os = "macos")]
