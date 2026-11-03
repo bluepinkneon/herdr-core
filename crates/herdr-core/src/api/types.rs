@@ -358,6 +358,10 @@ pub struct AttachParams {
     #[arg(long)]
     #[serde(default)]
     pub observe: bool,
+    /// Permit native wheel-generated input only; observe still denies DATA and resize.
+    #[arg(skip)]
+    #[serde(default)]
+    pub scroll_input: bool,
     /// Scrollback lines to show first (main screen only).
     #[arg(long, default_value_t = 0)]
     #[serde(default)]
@@ -387,6 +391,47 @@ pub struct AttachResult {
     /// RESIZE, FOCUS, FACTS, CREDIT and CLOSE frames control it.
     pub channel: u32,
     pub terminal: Public,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ScrollParams {
+    /// Channel on this framed connection, attached to this exact local terminal address.
+    pub channel: u32,
+    pub terminal: String,
+    /// Negative moves up/older; positive down/newer. Bounded to -1000..1000.
+    pub lines: i32,
+    /// Zero-based pointer cell inside the exact attachment and native screen geometry.
+    pub column: u16,
+    pub row: u16,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+#[derive(Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ScrollRoute {
+    Viewport,
+    Mouse,
+    Alternate,
+    None,
+}
+
+#[derive(Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ScrollInput {
+    None,
+    Forwarded,
+    Held,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct ScrollResult {
+    pub route: ScrollRoute,
+    /// Queue acceptance only, never a PTY-read, program or display receipt.
+    pub input: ScrollInput,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at_bottom: Option<bool>,
 }
 
 #[derive(clap::Args, Serialize, Deserialize, JsonSchema, Default)]

@@ -873,6 +873,45 @@
         ],
         "type": "object"
       },
+      "ScrollInput": {
+        "enum": [
+          "none",
+          "forwarded",
+          "held"
+        ],
+        "type": "string"
+      },
+      "ScrollResult": {
+        "properties": {
+          "at_bottom": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "input": {
+            "$ref": "#/components/schemas/ScrollInput",
+            "description": "Queue acceptance only, never a PTY-read, program or display receipt."
+          },
+          "route": {
+            "$ref": "#/components/schemas/ScrollRoute"
+          }
+        },
+        "required": [
+          "route",
+          "input"
+        ],
+        "type": "object"
+      },
+      "ScrollRoute": {
+        "enum": [
+          "viewport",
+          "mouse",
+          "alternate",
+          "none"
+        ],
+        "type": "string"
+      },
       "SendResult": {
         "properties": {
           "started": {
@@ -1389,7 +1428,7 @@
       "name": "Apache-2.0"
     },
     "title": "herdr-core",
-    "version": "0.1.15"
+    "version": "0.1.15-source.1"
   },
   "methods": [
     {
@@ -2266,6 +2305,16 @@
           }
         },
         {
+          "description": "Permit native wheel-generated input only; observe still denies DATA and resize.",
+          "name": "scroll_input",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "Permit native wheel-generated input only; observe still denies DATA and resize.",
+            "type": "boolean"
+          }
+        },
+        {
           "description": "The terminal: `t7`, a name, or `machine/t7`.",
           "name": "terminal",
           "required": true,
@@ -2279,6 +2328,140 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/AttachResult"
+        }
+      }
+    },
+    {
+      "description": "Scroll this connection's exact attached terminal through native mouse, alternate-scroll keys or viewer history. Never extends keyboard quiet; no retry after a lost reply.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "needs_framed"
+          },
+          "message": "needs_framed"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "stale_channel"
+          },
+          "message": "stale_channel"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "geometry_mismatch"
+          },
+          "message": "geometry_mismatch"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "input_not_allowed"
+          },
+          "message": "input_not_allowed"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "finished"
+          },
+          "message": "finished"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        }
+      ],
+      "name": "terminal.scroll",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "Channel on this framed connection, attached to this exact local terminal address.",
+          "name": "channel",
+          "required": true,
+          "schema": {
+            "description": "Channel on this framed connection, attached to this exact local terminal address.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        {
+          "name": "cols",
+          "required": true,
+          "schema": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        {
+          "description": "Zero-based pointer cell inside the exact attachment and native screen geometry.",
+          "name": "column",
+          "required": true,
+          "schema": {
+            "description": "Zero-based pointer cell inside the exact attachment and native screen geometry.",
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        {
+          "description": "Negative moves up/older; positive down/newer. Bounded to -1000..1000.",
+          "name": "lines",
+          "required": true,
+          "schema": {
+            "description": "Negative moves up/older; positive down/newer. Bounded to -1000..1000.",
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        {
+          "name": "row",
+          "required": true,
+          "schema": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        {
+          "name": "rows",
+          "required": true,
+          "schema": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        {
+          "name": "terminal",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/ScrollResult"
         }
       }
     },

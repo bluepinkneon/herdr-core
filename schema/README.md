@@ -40,7 +40,7 @@ Errors are JSON-RPC errors with a stable kind and a hint:
 ```
 
 `hello` with `{"framed": true}` switches the connection to **framed mode**
-after its reply. Attach needs it; everything else works in both modes.
+after its reply. Attach and native scroll need it; other calls work in both modes.
 
 ## Framed mode
 
@@ -64,8 +64,8 @@ Channel 0 carries JSON-RPC both ways. Calls on it run side by side.
 (the current screen, optional history, the latest status report and title,
 and `CSI ?9001h` or `l`: whether the program asked for win32-input-mode,
 as Windows' ConPTY does when it starts), then the program's raw output,
-minus terminal queries the core already answered. The core never encodes
-keys: a viewer that honors 9001 sends key events in that format itself.
+minus terminal queries the core already answered. Ordinary DATA is already
+encoded: a viewer that honors 9001 sends key events in that format itself.
 The viewer sends keys as DATA on the same channel, and RESIZE,
 FOCUS and FACTS as it changes. The last active viewer sets the size
 (active: it typed, resized, gained focus or sent FACTS); `observe` viewers never type or resize.
@@ -74,6 +74,30 @@ Flow control: a stream starts with 256 KiB of credit. The viewer sends
 CREDIT for the bytes it has written out. A viewer that falls more than
 4 MiB behind gets a fresh repaint instead of the backlog. A stalled stream
 never blocks channel 0 or other streams.
+
+### Native wheel and history (0.1.15-source.1)
+
+On that same connection, call `terminal.scroll` with the attachment's `channel`,
+exact local `terminal` address, signed `lines` (-1000..1000; negative up/older),
+zero-based `column`/`row`, and exact `cols`/`rows`. Foreign or retired channels,
+aliases, unknown fields, out-of-range cells and mismatched native/attachment
+geometry refuse before input. Zero lines is an observed no-op. Do not resend
+a gesture after a lost reply: this method has no retry key.
+
+Native mouse reporting takes precedence in either buffer; otherwise alternate
+screen plus DEC1007 uses native up/down keys. These input routes require the
+attachment's explicit `scroll_input:true` (default false). Even with that grant,
+`observe:true` still denies DATA, resize and focus input. Alternate screen with
+neither route is a no-op. Main-screen history scroll changes only this viewer,
+using one tracked native anchor and the existing formatter/credit stream.
+Output, resize/reflow and pruning update the anchor; reset, discarded history
+or an alternate-screen switch return it live. Detach releases the anchor.
+
+The result reports `route` (`viewport`, `mouse`, `alternate`, `none`) and `input`
+(`none`, `forwarded`, `held`); viewport results also report `at_bottom`.
+`forwarded` means holder-queue acceptance, not PTY consumption or a painted frame.
+`held` uses the existing automatic-input order. Wheel input never extends the
+keyboard quiet interval; genuine DATA retains it. Other viewers remain live.
 
 A viewer detaches by sending CLOSE; the core answers with an empty CLOSE.
 When the program ends, the core sends CLOSE with

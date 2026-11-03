@@ -111,6 +111,11 @@ hc read web --lines 100
 `[hc] still running as t3` and exits 124, but the program keeps running.
 Use the returned address to wait/read it; don't launch a duplicate.
 `hc attach <t>` lets a person interact directly; Ctrl+\ detaches.
+
+Custom `0.1.15-source.1` also supports native scrolling through `terminal.scroll`
+on the same framed attachment (see `schema/README.md`). It does not extend
+keyboard quiet. Native wheel input requires explicit `scroll_input`; an
+observer still cannot type or resize. Lost scroll replies must not be retried.
 `hc put <t> <file>` sends a file beside a terminal and prints its destination.
 `hc label <t> key=value` adds labels.
 
