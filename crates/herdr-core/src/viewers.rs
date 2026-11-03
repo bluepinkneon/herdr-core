@@ -29,6 +29,8 @@ pub struct Viewer {
     pub conn: Arc<Conn>,
     pub channel: u32,
     pub observe: bool,
+    scroll_input: bool,
+    viewport: Option<ghostty_vt::Viewport>,
     size: (u16, u16),
     /// None: not active since it came back after a dropped line.
     active_at: Option<Instant>,
@@ -43,6 +45,7 @@ fn rgb(hex: &Option<String>) -> Option<Rgb> {
 
 pub struct AttachRequest {
     pub observe: bool,
+    pub scroll_input: bool,
     pub history: usize,
     pub size: (u16, u16),
     pub display: Display,
@@ -68,6 +71,8 @@ impl Core {
             conn: conn.clone(),
             channel,
             observe: req.observe,
+            scroll_input: req.scroll_input,
+            viewport: None,
             size: req.size,
             active_at: (!req.resumed).then(Instant::now),
             display: req.display,
@@ -92,7 +97,7 @@ impl Core {
         // While a read scrolls the app, its frames are ours alone: viewers get one repaint after.
         let scrolling = st.stitching.contains(&id);
         let instance = st.reg.terminals.get(&id).and_then(|t| t.holder.clone());
-        let State { screens, relays, viewers, holders, output_watch, .. } = st;
+        let State { screens, relays, holders, output_watch, .. } = st;
         let holder = holders.iter().find(|l| Some(&l.instance) == instance.as_ref());
         let Some(screen) = screens.get_mut(&id) else { return };
         let relay = relays.entry(id).or_default();
@@ -107,26 +112,12 @@ impl Core {
         let reports = screen.take_status_reports();
         let title = screen.take_title_changed().then(|| screen.title());
         let full_screen = screen.alt_screen();
-        let mut behind = Vec::new();
-        for v in viewers.get(&id).into_iter().flatten().filter(|_| !scrolling) {
-            v.conn.with(|ob| {
-                if !ob.data(v.channel, &out) {
-                    behind.push((v.conn.clone(), v.channel));
-                }
-            });
-        }
         // Before any repaint below, so it carries the mode this output just set.
         if let Some(on) = win32_input
             && let Some(t) = st.reg.terminals.get_mut(&id).filter(|t| t.win32_input != on)
         {
             t.win32_input = on;
             self.save(st);
-        }
-        for (conn, channel) in behind {
-            let paint = first_paint(st, id, 0); // too far behind: start over from now
-            conn.with(|ob| {
-                ob.data(channel, &paint);
-            });
         }
         if full_screen && let Some(t) = st.reg.terminals.get_mut(&id) {
             t.full_screen = true;
@@ -138,6 +129,22 @@ impl Core {
             st.reg.terminals.get_mut(&id).expect("live terminal").title = title.clone();
             self.save_soon();
             self.emit(st, "title", id, serde_json::json!({"title": title}));
+        }
+        let State { screens, viewers, reg, .. } = st;
+        let screen = screens.get_mut(&id).expect("output screen");
+        for v in viewers.get_mut(&id).into_iter().flatten().filter(|_| !scrolling) {
+            let paint = v.viewport.is_some().then(|| paint_viewer(screen, &reg.terminals[&id], v));
+            let bytes = paint.as_deref().unwrap_or(&out);
+            let mut queued = false;
+            v.conn.with(|ob| {
+                queued = ob.data(v.channel, bytes);
+            });
+            if !queued {
+                let paint = paint.unwrap_or_else(|| paint_viewer(screen, &reg.terminals[&id], v));
+                v.conn.with(|ob| {
+                    ob.data(v.channel, &paint);
+                });
+            }
         }
     }
 
@@ -205,6 +212,85 @@ impl Core {
         }
     }
 
+    /// Route one native wheel request under the same lock as output, modes and input.
+    pub fn viewer_scroll(
+        &self,
+        conn: &Arc<Conn>,
+        p: crate::api::ScrollParams,
+    ) -> Result<crate::api::ScrollResult, RpcError> {
+        use crate::api::{ScrollInput, ScrollResult, ScrollRoute};
+        if !(-1000..=1000).contains(&p.lines) || p.cols == 0 || p.rows == 0 || p.column >= p.cols || p.row >= p.rows {
+            return Err(RpcError::invalid_params("scroll lines or pointer geometry out of bounds"));
+        }
+        let mut st = self.lock();
+        let (id, v) = Self::viewer(&mut st, conn, p.channel)
+            .filter(|(id, _)| p.terminal == crate::terminals::address(*id))
+            .ok_or_else(|| RpcError::new("stale_channel", "no matching local attachment on this connection", ""))?;
+        let (size, allowed) = (v.size, v.scroll_input);
+        if st.stopping || self.restart.load(std::sync::atomic::Ordering::SeqCst) || st.link(id).is_none() {
+            return Err(RpcError::new("unavailable", "terminal holder unavailable or core retiring", ""));
+        }
+        st.reg.terminals[&id].check_program()?;
+        let screen = st.screens.get(&id).ok_or_else(|| RpcError::new("finished", "terminal has finished", ""))?;
+        if size != (p.cols, p.rows) || screen.size() != size {
+            return Err(RpcError::new(
+                "geometry_mismatch",
+                "attachment and native screen must match requested geometry",
+                "",
+            ));
+        }
+        let none = ScrollResult { route: ScrollRoute::None, input: ScrollInput::None, at_bottom: None };
+        if p.lines == 0 {
+            return Ok(none);
+        }
+        let mut bytes = screen.wheel_at(p.lines < 0, p.column, p.row);
+        let route = if !bytes.is_empty() {
+            ScrollRoute::Mouse
+        } else if screen.alt_screen() && screen.dec_mode(1007) {
+            bytes = crate::keys::encode(screen, if p.lines < 0 { "up" } else { "down" })?;
+            ScrollRoute::Alternate
+        } else if screen.alt_screen() {
+            return Ok(none);
+        } else {
+            let State { screens, viewers, reg, .. } = &mut *st;
+            let screen = screens.get_mut(&id).expect("screen checked under lock");
+            let v = viewers
+                .get_mut(&id)
+                .expect("viewer checked")
+                .iter_mut()
+                .find(|v| Arc::ptr_eq(&v.conn, conn) && v.channel == p.channel)
+                .expect("viewer checked");
+            let bottom = screen
+                .scroll_viewport(&mut v.viewport, p.lines)
+                .map_err(|why| RpcError::new("unavailable", why, ""))?;
+            let paint = paint_viewer(screen, &reg.terminals[&id], v);
+            v.conn.with(|out| {
+                if !out.data(v.channel, &paint) {
+                    out.data(v.channel, &paint);
+                }
+            });
+            return Ok(ScrollResult {
+                route: ScrollRoute::Viewport,
+                input: ScrollInput::None,
+                at_bottom: Some(bottom),
+            });
+        };
+        if !allowed {
+            return Err(RpcError::new("input_not_allowed", "attachment does not permit native scroll input", ""));
+        }
+        let bytes = bytes.repeat(p.lines.unsigned_abs() as usize);
+        let input = match st.gates.entry(id).or_default().scroll(&bytes) {
+            None => ScrollInput::Held,
+            Some(bytes) => {
+                if !st.link(id).expect("holder checked under lock").try_input(id, &bytes) {
+                    return Err(RpcError::new("unavailable", "holder input queue closed", ""));
+                }
+                ScrollInput::Forwarded
+            }
+        };
+        Ok(ScrollResult { route, input, at_bottom: None })
+    }
+
     pub fn viewer_resize(&self, conn: &Arc<Conn>, channel: u32, cols: u16, rows: u16) {
         let mut st = self.lock();
         self.touch(&mut st, conn, channel, |v| v.size = (cols, rows));
@@ -236,9 +322,16 @@ impl Core {
         let mut st = self.lock();
         self.unsubscribe(&mut st, conn, channel);
         let mut touched = Vec::new();
-        for (id, vs) in st.viewers.iter_mut() {
+        let State { screens, viewers, .. } = &mut *st;
+        for (id, vs) in viewers.iter_mut() {
             let before = vs.len();
-            vs.retain(|v| !(Arc::ptr_eq(&v.conn, conn) && channel.is_none_or(|c| c == v.channel)));
+            vs.retain_mut(|v| {
+                let remove = Arc::ptr_eq(&v.conn, conn) && channel.is_none_or(|c| c == v.channel);
+                if remove && let Some(screen) = screens.get_mut(id) {
+                    screen.release_viewport(&mut v.viewport);
+                }
+                !remove
+            });
             if vs.len() != before {
                 touched.push(*id);
             }
@@ -280,11 +373,33 @@ impl Core {
 /// either way).
 pub(crate) fn first_paint(st: &State, id: u32, history: usize) -> Vec<u8> {
     let mut paint = st.screens[&id].paint(history);
-    let t = &st.reg.terminals[&id];
+    paint_status(&mut paint, &st.reg.terminals[&id]);
+    paint
+}
+
+fn paint_status(paint: &mut Vec<u8>, t: &crate::terminals::Terminal) {
     paint.extend(if t.win32_input { b"\x1b[?9001h" } else { b"\x1b[?9001l" });
     let root = t.status.iter().map(|s| ("", s));
     for (rid, status) in root.chain(t.records.iter().map(|(k, s)| (k.as_str(), s))) {
         paint.extend(status.encode(rid).as_bytes());
     }
+}
+
+fn paint_viewer(screen: &mut ghostty_vt::Terminal, t: &crate::terminals::Terminal, v: &mut Viewer) -> Vec<u8> {
+    let mut paint = screen.paint_viewport(&mut v.viewport);
+    paint_status(&mut paint, t);
     paint
+}
+
+pub(crate) fn repaint_viewers(st: &mut State, id: u32) {
+    let State { screens, viewers, reg, .. } = st;
+    let Some(screen) = screens.get_mut(&id) else { return };
+    for v in viewers.get_mut(&id).into_iter().flatten() {
+        let paint = paint_viewer(screen, &reg.terminals[&id], v);
+        v.conn.with(|out| {
+            if !out.data(v.channel, &paint) {
+                out.data(v.channel, &paint);
+            }
+        });
+    }
 }

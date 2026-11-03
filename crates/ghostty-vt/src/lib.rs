@@ -3,6 +3,9 @@
 use std::ffi::c_void;
 use std::ptr;
 
+mod viewport;
+pub use viewport::Viewport;
+
 mod ffi {
     use std::ffi::c_void;
 
@@ -56,6 +59,7 @@ mod ffi {
     pub const FORMAT_PLAIN: i32 = 0;
     pub const FORMAT_VT: i32 = 1;
     pub const POINT_ACTIVE: i32 = 0;
+    pub const POINT_SCREEN: i32 = 2;
     pub const POINT_HISTORY: i32 = 3;
 
     #[repr(C)]
@@ -188,6 +192,10 @@ mod ffi {
         pub fn ghostty_terminal_vt_write(t: Terminal, data: *const u8, len: usize);
         pub fn ghostty_terminal_resize(t: Terminal, cols: u16, rows: u16, cw: u32, ch: u32) -> i32;
         pub fn ghostty_terminal_grid_ref(t: Terminal, point: Point, out: *mut GridRef) -> i32;
+        pub fn ghostty_terminal_grid_ref_track(t: Terminal, point: Point, out: *mut *mut c_void) -> i32;
+        pub fn ghostty_tracked_grid_ref_free(r: *mut c_void);
+        pub fn ghostty_tracked_grid_ref_point(r: *mut c_void, tag: i32, out: *mut Coord) -> i32;
+        pub fn ghostty_tracked_grid_ref_set(r: *mut c_void, t: Terminal, point: Point) -> i32;
         pub fn ghostty_formatter_terminal_new(
             alloc: *const c_void,
             out: *mut Formatter,
@@ -293,6 +301,9 @@ struct Hooks {
 pub struct Terminal {
     raw: ffi::Terminal,
     hooks: Box<Hooks>,
+    // Native references stay owned by this terminal: no handle can outlive or
+    // concurrently mutate it through a viewer on another thread.
+    viewports: std::collections::BTreeMap<u64, viewport::Anchor>,
 }
 
 // The handle is only touched through `&mut self` / `&self`; libghostty keeps no thread state.
@@ -386,7 +397,7 @@ impl Terminal {
             cell: DEFAULT_CELL,
             dark: true,
         });
-        let term = Terminal { raw, hooks };
+        let term = Terminal { raw, hooks, viewports: Default::default() };
         let ud: *const Hooks = &*term.hooks;
         let continuation = CONTINUATION_MAX_BYTES;
         unsafe {
@@ -466,6 +477,12 @@ impl Terminal {
     /// asked for mouse reports; empty if it didn't ask (it doesn't take the wheel).
     pub fn wheel(&self, up: bool) -> Vec<u8> {
         let (cols, rows) = self.size();
+        self.wheel_at(up, cols / 2, rows / 2)
+    }
+
+    /// A native wheel notch at a zero-based cell, encoded in the program's mouse mode.
+    pub fn wheel_at(&self, up: bool, column: u16, row: u16) -> Vec<u8> {
+        let (cols, rows) = self.size();
         let (cw, ch) = self.hooks.cell;
         unsafe {
             let (mut enc, mut ev) = (ptr::null_mut(), ptr::null_mut());
@@ -491,8 +508,7 @@ impl Terminal {
             ffi::ghostty_mouse_encoder_setopt(enc, 2, (&raw const size).cast());
             ffi::ghostty_mouse_event_set_action(ev, 0);
             ffi::ghostty_mouse_event_set_button(ev, if up { 4 } else { 5 });
-            let at =
-                ffi::MousePosition { x: (cols / 2) as f32 * cw as f32 + 1.0, y: (rows / 2) as f32 * ch as f32 + 1.0 };
+            let at = ffi::MousePosition { x: column as f32 * cw as f32 + 1.0, y: row as f32 * ch as f32 + 1.0 };
             ffi::ghostty_mouse_event_set_position(ev, at);
             let mut buf = [0u8; 64];
             let mut len = 0usize;
@@ -652,6 +668,10 @@ impl Terminal {
     /// scrollback lines (main screen only), then the screen with its modes,
     /// cursor and title.
     pub fn paint(&self, history: usize) -> Vec<u8> {
+        self.paint_at(history, None)
+    }
+
+    fn paint_at(&self, history: usize, top: Option<u32>) -> Vec<u8> {
         let (cols, rows) = self.size();
         let last = (cols.saturating_sub(1), rows.saturating_sub(1) as u32);
         // A soft reset leaves mouse, focus, paste, sync and key modes alone: turn
@@ -674,12 +694,19 @@ impl Terminal {
         if self.alt_screen() {
             out.extend(b"\x1b[?1049h");
         }
-        if let Some(sel) = self.select(ffi::POINT_ACTIVE, (0, 0), last) {
+        let selection = match top {
+            Some(top) => self.select(ffi::POINT_SCREEN, (0, top), (last.0, top + last.1)),
+            None => self.select(ffi::POINT_ACTIVE, (0, 0), last),
+        };
+        if let Some(sel) = selection {
             let screen = self.format(ffi::FORMAT_VT, Some(&sel), true);
             // Alternate-screen aliases can disagree with the active screen. Replay
             // only the screen chosen above, not the formatter's independent mode bits.
             // Synchronized output belongs to the old viewer and would freeze a new one.
             out.extend(strip(&screen, &[b"\x1b[?2026h", b"\x1b[?47h", b"\x1b[?1047h", b"\x1b[?1049h"]));
+        }
+        if top.is_some() {
+            out.extend(b"\x1b[?25l"); // the live cursor is outside a held history view
         }
         let title = self.title();
         if !title.is_empty() {
@@ -712,6 +739,7 @@ impl Terminal {
 
 impl Drop for Terminal {
     fn drop(&mut self) {
+        self.viewports.clear();
         unsafe { ffi::ghostty_terminal_free(self.raw) }
     }
 }

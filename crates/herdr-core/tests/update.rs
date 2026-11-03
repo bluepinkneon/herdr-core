@@ -18,7 +18,8 @@ fn an_up_to_date_binary_restarts_only_an_older_running_core() {
     )
     .unwrap();
     s.env.push(("HERDR_RELEASES_URL".into(), format!("file://{}", s.root.display())));
-    let args = ["update", "--version", version];
+    // --version names an upstream release; owned builds retain its numeric minimum.
+    let args = ["update", "--version", version.split('-').next().unwrap()];
     assert_eq!(s.json(&args)["updated"], false);
     assert!(!s.connect_ok(), "checking an absent core must not start one");
     std::fs::create_dir_all(s.socket().parent().unwrap()).unwrap();

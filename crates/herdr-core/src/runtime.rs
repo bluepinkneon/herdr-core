@@ -128,6 +128,11 @@ impl Link {
             self.send(&proto::frame(proto::INPUT, id, bytes));
         }
     }
+
+    /// Whether the existing holder queue accepted these bytes, not a PTY-read receipt.
+    pub fn try_input(&self, id: u32, bytes: &[u8]) -> bool {
+        bytes.is_empty() || self.writer.send(proto::frame(proto::INPUT, id, bytes)).is_ok()
+    }
 }
 
 const SAVE_SOON: Duration = Duration::from_secs(2);

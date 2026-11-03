@@ -94,6 +94,9 @@ methods! { Ctx<'_>;
     "terminal.attach" => terminal_attach, AttachParams => AttachResult,
         "Open a raw stream to a live terminal on this framed connection (see `hello` with `framed`). Loss ends the stream even when kept; reattach after the restarted event.",
         errors ["not_found", "machine_unknown", "finished", "unavailable", "needs_framed"];
+    "terminal.scroll" => terminal_scroll, ScrollParams => ScrollResult,
+        "Scroll this connection's exact attached terminal through native mouse, alternate-scroll keys or viewer history. Never extends keyboard quiet; no retry after a lost reply.",
+        errors ["needs_framed", "invalid_params", "stale_channel", "geometry_mismatch", "input_not_allowed", "finished", "unavailable"];
     "terminal.send" => terminal_send, SendParams => SendResult,
         "Paste text and press Enter, once nobody has typed for ~3 s; keys a person presses meanwhile are held, then delivered. Refuses a blocked program unless `force`.",
         errors ["not_found", "machine_unknown", "finished", "unavailable", "blocked", "status_mismatch", "invalid_params", "config"];
@@ -396,6 +399,7 @@ async fn terminal_attach(core: Ctx<'_>, p: AttachParams) -> Result<AttachResult,
     }
     let req = crate::viewers::AttachRequest {
         observe: p.observe,
+        scroll_input: p.scroll_input,
         history: p.history,
         size: (p.cols, p.rows),
         display: p.display,
@@ -403,6 +407,11 @@ async fn terminal_attach(core: Ctx<'_>, p: AttachParams) -> Result<AttachResult,
     };
     let channel = core.attach(conn, id, req)?;
     Ok(AttachResult { channel, terminal: Public(record(core, id)?) })
+}
+
+async fn terminal_scroll(core: Ctx<'_>, p: ScrollParams) -> Result<ScrollResult, RpcError> {
+    let conn = core.conn.ok_or_else(|| RpcError::new("needs_framed", "scroll needs its framed attachment", ""))?;
+    core.viewer_scroll(conn, p)
 }
 
 async fn terminal_send(core: Ctx<'_>, p: SendParams) -> Result<SendResult, RpcError> {

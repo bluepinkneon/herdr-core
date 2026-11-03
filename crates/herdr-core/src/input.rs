@@ -43,11 +43,17 @@ impl Gate {
     /// Returns what to write now.
     pub fn human(&mut self, bytes: &[u8]) -> Vec<u8> {
         self.last_human = Some(Instant::now());
+        self.scroll(bytes).unwrap_or_default()
+    }
+
+    /// Native wheel input shares the held-input order without extending keyboard quiet.
+    /// None means the current automatic input section holds these bytes.
+    pub fn scroll(&mut self, bytes: &[u8]) -> Option<Vec<u8>> {
         if self.busy {
             self.held.extend_from_slice(bytes);
-            Vec::new()
+            None
         } else {
-            bytes.to_vec()
+            Some(bytes.to_vec())
         }
     }
 }
@@ -320,6 +326,22 @@ impl Core {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scroll_and_keys_keep_the_same_atomic_held_order_without_extending_keyboard_quiet() {
+        let mut gate = Gate::default();
+        assert_eq!(gate.scroll(b"wheel"), Some(b"wheel".to_vec()));
+        assert!(gate.last_human.is_none());
+        gate.human(b"a");
+        let before = gate.last_human;
+        gate.set_busy(true);
+        assert_eq!(gate.scroll(b"up"), None);
+        assert_eq!(gate.last_human, before);
+        assert!(gate.human(b"b").is_empty());
+        assert_eq!(gate.scroll(b"down"), None);
+        assert_eq!(gate.set_busy(false), b"upbdown");
+        assert!(!gate.has_held());
+    }
 
     #[test]
     fn pastes_are_bracketed_only_when_asked_and_cannot_end_early() {

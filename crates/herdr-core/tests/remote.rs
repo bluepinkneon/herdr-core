@@ -126,7 +126,9 @@ fn two_machines_that_added_each_other_never_echo_events_back() {
     });
     let mut c = s.connect();
     c.call(1, "events.subscribe", json!({}));
-    c.call(2, "doc.set", json!({"name": "app", "value": 1, "version": 0}));
+    // A plain subscription is notifications-only: send requests on another connection.
+    let changed = s.connect().call(2, "doc.set", json!({"name": "app", "value": 1, "version": 0}));
+    assert!(changed.get("result").is_some(), "{changed}");
     // Two sleeping terminals and one document change: a handful of events, not a storm.
     c.reader.get_ref().set_read_timeout(Some(std::time::Duration::from_millis(100))).unwrap();
     let (started, mut events) = (std::time::Instant::now(), 0);
