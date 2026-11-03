@@ -89,12 +89,29 @@ fn failed_shell_restart_stays_live_and_retries() {
     s.env.push(("SHELL".into(), shell.display().to_string()));
     let t = run(&s, &["--keep", "--rm", "sleep", "100"]);
     s.json(&["server", "stop"]);
-    let r = get(&s, &t);
-    assert_eq!(r["state"], "live");
-    assert!(r["finished_ms"].is_null());
+    get(&s, &t); // Start the core, but do not race its asynchronous missing-shell attempt.
+    let mut failed = serde_json::Value::Null;
+    wait_until("missing shell attempt failed", || {
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(s.root.join("state/herdr-core/test/terminals.json")).unwrap())
+                .unwrap();
+        failed = saved["terminals"]["1"].clone();
+        failed["argv"][0] == shell.display().to_string() && failed["holder"].is_null()
+    });
+    assert_eq!(failed["state"], "live");
+    assert!(failed["finished_ms"].is_null());
+    assert!(failed["pid"].is_null());
     std::fs::write(&shell, "#!/bin/sh\nexec /bin/sh\n").unwrap();
     std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700)).unwrap();
-    wait_until("retry succeeds", || get(&s, &t)["pid"].is_number());
+    // Stop/start and the failed spawn have already backed off past the usual 10 s cap.
+    // Allow that recorded delay, then the same 10 s scheduling allowance.
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let remaining = failed["restart_after_ms"].as_u64().unwrap().saturating_sub(now);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(remaining + 10_000);
+    while !get(&s, &t)["pid"].is_number() {
+        assert!(std::time::Instant::now() < deadline, "retry missed its recorded deadline: {failed}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
     assert_eq!(s.json(&["ls"])["terminals"].as_array().unwrap().len(), 1);
     let r = get(&s, &t);
     assert!(r["reason"].is_null());
