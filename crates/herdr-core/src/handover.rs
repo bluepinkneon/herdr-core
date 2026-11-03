@@ -34,7 +34,7 @@ pub(crate) fn serve(args: ServeArgs) -> io::Result<()> {
     if socket != paths.socket.as_os_str().as_encoded_bytes() {
         return Err(io::Error::other("handover lock names a different socket"));
     }
-    if platform::try_lock(&lock) {
+    if platform::handover::try_lock(&lock)? {
         return Err(io::Error::other("handover predecessor no longer holds the session lock"));
     }
     let stream = platform::connect(&paths.socket)?;
@@ -60,7 +60,7 @@ pub(crate) fn serve(args: ServeArgs) -> io::Result<()> {
     process.wait()?;
     // Any competing owner holds instead of being adopted or restarted. This
     // exact file handle stays locked through Core::start and the serving loop.
-    if !platform::try_lock(&lock) {
+    if !platform::handover::try_lock(&lock)? {
         return Err(io::Error::other("handover adoption held: another process owns the session lock"));
     }
     platform::handover::same_lock(&lock, &lock_path)?;

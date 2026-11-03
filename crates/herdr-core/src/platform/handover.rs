@@ -28,6 +28,9 @@ mod unsupported {
     pub fn same_lock(_: &File, _: &Path) -> io::Result<()> {
         Err(error())
     }
+    pub fn try_lock(_: &File) -> io::Result<bool> {
+        Err(error())
+    }
 }
 #[cfg(windows)]
 pub use unsupported::*;
