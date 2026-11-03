@@ -301,8 +301,11 @@ fn waits_end_when_a_kept_program_is_lost() {
 #[test]
 fn a_kept_run_timeout_retains_the_claim_until_the_holder_answers() {
     let mut s = Session::new();
-    s.env.push(("HC_SPAWN_MS".into(), "50".into()));
+    // Establish the live holder under the normal spawn deadline. The 50 ms
+    // deadline belongs to the deliberately stopped-holder request below.
     run(&s, &["sleep", "100"]);
+    s.env.push(("HC_SPAWN_MS".into(), "50".into()));
+    s.json(&["server", "restart"]);
     let holder = s.json(&["server", "status"])["holder"]["pid"].as_i64().unwrap() as i32;
     unsafe {
         libc::kill(holder, libc::SIGSTOP);

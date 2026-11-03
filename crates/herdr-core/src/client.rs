@@ -168,8 +168,29 @@ pub fn spawn_core(paths: &Paths) -> Result<(), RpcError> {
     spawn_detached(paths, &["serve"], "core.log").map_err(|e| unavailable(format!("cannot start core: {e}")))
 }
 
-/// Starts `herdr-core <args>` on its own (Linux: as a user service), logging
-/// to the state dir.
+/// Explicit recovery inside an already retained external OS owner. Unlike
+/// autostart, this never creates another systemd unit or accepts a stock daemon.
+pub fn start_external(paths: &Paths) -> Result<Value, RpcError> {
+    platform::keeper::birth(std::process::id()).map_err(|e| unavailable(e.to_string()))?;
+    let stream = if let Some(stream) = connect_existing(paths) {
+        stream
+    } else {
+        crate::keeper::settle(paths).map_err(|e| unavailable(e.to_string()))?;
+        spawn_detached(paths, &["serve", "--external-owner"], "core.log").map_err(|e| unavailable(e.to_string()))?;
+        wait_for_socket(&paths.socket, "external core").map_err(unavailable)?
+    };
+    let status = call(&stream, "server.status", json!({}))?;
+    if status["external_owner"] != true
+        || status["keepers_ready"] != true
+        || status["version"] != env!("CARGO_PKG_VERSION")
+    {
+        return Err(unavailable("existing core is not the ready external-owner target; no restart issued".into()));
+    }
+    Ok(status)
+}
+
+/// Starts `herdr-core <args>` detached, logging to the state dir. Externally
+/// owned daemons/holders remain in their calling OS group; others may use a unit.
 pub fn spawn_detached(paths: &Paths, args: &[&str], log: &str) -> std::io::Result<()> {
     paths.create_dirs()?;
     let log = paths.state.join(log);
@@ -179,7 +200,9 @@ pub fn spawn_detached(paths: &Paths, args: &[&str], log: &str) -> std::io::Resul
     // ending the terminal must not end them.
     cmd.args(args).env_remove(crate::sweep::VAR).env(crate::sweep::RUNTIME, "1");
     #[cfg(target_os = "linux")]
-    if let Some(started) = platform::systemd::spawn(&cmd, &log) {
+    if !args.contains(&"--external-owner")
+        && let Some(started) = platform::systemd::spawn(&cmd, &log)
+    {
         return started;
     }
     let log = std::fs::OpenOptions::new().create(true).append(true).open(log)?;

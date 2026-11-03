@@ -106,9 +106,16 @@ enum Cmd {
         session: Option<String>,
     },
     #[command(hide = true)]
-    Serve,
+    Serve(crate::handover::ServeArgs),
     #[command(hide = true)]
     Hold {
+        #[arg(long)]
+        socket: std::path::PathBuf,
+        #[arg(long)]
+        external_owner: bool,
+    },
+    #[command(hide = true)]
+    KeepHolder {
         #[arg(long)]
         socket: std::path::PathBuf,
     },
@@ -116,7 +123,11 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum ServerCmd {
-    Start,
+    Start {
+        /// Keep the daemon and its helpers in the invoking external OS owner.
+        #[arg(long)]
+        external_owner: bool,
+    },
     Stop,
     Status,
     /// Restart the core (e.g. after an update); programs keep running.
@@ -335,12 +346,16 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
     let pick = |given: String| target((!given.is_empty()).then_some(given));
     let pick_finished = |given: String| crate::cli::target(&paths, (!given.is_empty()).then_some(given), json, true);
     Ok(Some(match cmd {
-        Cmd::Serve => {
-            crate::server::serve().map_err(|e| RpcError::internal(e.to_string()))?;
+        Cmd::Serve(args) => {
+            crate::handover::serve(args).map_err(|e| RpcError::internal(e.to_string()))?;
             return Ok(None);
         }
-        Cmd::Hold { socket } => {
-            crate::holder::run(socket).map_err(|e| RpcError::internal(e.to_string()))?;
+        Cmd::Hold { socket, external_owner } => {
+            crate::holder::run(socket, external_owner).map_err(|e| RpcError::internal(e.to_string()))?;
+            return Ok(None);
+        }
+        Cmd::KeepHolder { socket } => {
+            crate::keeper::run(socket).map_err(|e| RpcError::internal(e.to_string()))?;
             return Ok(None);
         }
         Cmd::Attach(p) => {
@@ -542,14 +557,16 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
             let human = serde_json::to_string_pretty(&r).unwrap_or_default();
             Out { json: r, human }
         }
-        Cmd::Server { action: action @ (ServerCmd::Start | ServerCmd::Status | ServerCmd::Restart) } => {
+        Cmd::Server { action: action @ (ServerCmd::Start { .. } | ServerCmd::Status | ServerCmd::Restart) } => {
             if matches!(action, ServerCmd::Restart)
                 && let Some(stream) = client::connect_existing(&paths)
             {
                 client::call(&stream, "server.restart", json!({}))?;
                 wait_closed(&stream);
             }
-            let r = if crate::platform::status_may_start_core() {
+            let r = if matches!(action, ServerCmd::Start { external_owner: true }) {
+                client::start_external(&paths)?
+            } else if crate::platform::status_may_start_core() {
                 call("server.status", json!({}))?
             } else {
                 let stream = if matches!(action, ServerCmd::Status) {

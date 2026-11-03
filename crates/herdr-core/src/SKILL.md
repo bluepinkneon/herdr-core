@@ -116,6 +116,44 @@ Custom `0.1.15-source.1` also supports native scrolling through `terminal.scroll
 on the same framed attachment (see `schema/README.md`). It does not extend
 keyboard quiet. Native wheel input requires explicit `scroll_input`; an
 observer still cannot type or resize. Lost scroll replies must not be retried.
+
+In `0.1.15-source.2`, for an authorized Linux/Darwin service-owner upgrade, the replacement
+can run in its owner's main PID with `hc serve --handover-core-id ID
+--handover-pid PID --handover-version VERSION`. This requires the same
+`HC_SESSION`, state root and socket as the still-running predecessor. Optional
+`--handover-birth TOKEN` checks Linux `/proc/PID/stat` starttime ticks or Darwin
+`proc_bsdinfo` start seconds:microseconds. Native code verifies the socket peer,
+birth and saved identity, sends **one** restart, waits for kernel-observed old
+exit, then adopts under the same session lock without detaching. A missing or
+mismatched reply, competing owner or failed observation exits nonzero: hold
+the original operation; never retry the restart. Socket I/O has a 15-second
+inactivity timeout and old exit a 60-second cap. Existing programs are not killed.
+The service owner must preserve the old holders' process groups/cgroups;
+native handover alone cannot prevent OS cleanup of an old service's children.
+
+Handover selects **external ownership**. Subsequent starts use `hc serve
+--external-owner` in the owner's main PID, or `hc server start --external-owner
+--json` inside its retained OS group. The latter detaches within that group;
+it does not create another systemd unit. Ordinary autostart refuses an
+externally owned session. New holders in this mode never launch a core.
+
+Native keepers retain legacy holder connections while the daemon is absent,
+draining output without saving another history or replaying input. A replacement
+passes its actual session-lock descriptor; only that admitted owner can cause
+a fresh holder HELLO. Idle keepers never reconnect. Planned handover observes
+the holder's tail-clear/BYE and reconnects under that same lock before releasing
+the owner. Startup awaits exact keeper lock settlement, capped at 10 seconds;
+a live owner, changed/missing keeper or unresolved result holds recovery.
+
+`server.status` reports `external_owner`, `keepers_ready` and each holder's
+`keeper` (`pid`, kernel `birth`, random `instance`, `socket`). The external
+owner must verify those identities and their OS-group custody before recovery.
+Unexpected keeper loss leaves the current core alive holding its lock, refuses
+new input and reports `keepers_ready: false`; it does not declare programs or
+requests finished. If both keeper and core die, legacy stock supervision can
+still launch an old executable: that is held custody, never permission to adopt
+or kill it. Native records under `keepers/` remain for reconciliation.
+
 `hc put <t> <file>` sends a file beside a terminal and prints its destination.
 `hc label <t> key=value` adds labels.
 

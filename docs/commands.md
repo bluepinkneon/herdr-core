@@ -571,8 +571,9 @@ Options:
 Usage: hc server start [OPTIONS]
 
 Options:
-      --json  JSON output even in a terminal
-  -h, --help  Print help
+      --external-owner  Keep the daemon and its helpers in the invoking external OS owner
+      --json            JSON output even in a terminal
+  -h, --help            Print help
 ```
 
 ## hc server status

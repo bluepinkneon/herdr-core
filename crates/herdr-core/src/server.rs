@@ -17,23 +17,54 @@ type Reader = BufReader<platform::AsyncRead>;
 type Writer = platform::AsyncWrite;
 
 pub fn serve() -> io::Result<()> {
+    serve_external(false)
+}
+
+pub(crate) fn serve_external(external_owner: bool) -> io::Result<()> {
+    if external_owner {
+        platform::keeper::birth(std::process::id())?;
+    }
     let paths = Paths::from_env().map_err(|e| io::Error::other(e.message))?;
     paths.create_dirs()?;
-    let mut lock =
+    if !external_owner && paths.state.join("external-owner").try_exists()? {
+        return Err(io::Error::other("this session requires its external OS owner; no automatic core launch"));
+    }
+    if external_owner {
+        crate::keeper::settle(&paths)?;
+    }
+    let lock =
         std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(paths.state.join("core.lock"))?;
     // Someone else holds the lock: they serve (or are handing over to whoever
     // starts the next core). Waiting here would start an unwanted core after a stop.
     if !platform::try_lock(&lock) {
         return Ok(());
     }
+    let info = load_identity(&paths.state, platform::machine_id())?;
+    serve_locked(paths, lock, info, external_owner)
+}
+
+/// The foreground handover launcher transfers its exact lock into the server;
+/// releasing and reopening it here would admit a competing holder's core.
+pub(crate) fn serve_locked(
+    paths: Paths,
+    mut lock: std::fs::File,
+    info: CoreInfo,
+    external_owner: bool,
+) -> io::Result<()> {
     // Where we listen, for clients whose env points elsewhere.
     lock.set_len(0)?;
+    io::Seek::rewind(&mut lock)?;
     io::Write::write_all(&mut lock, paths.socket.as_os_str().as_encoded_bytes())?;
-    let info = load_identity(&paths.state, platform::machine_id())?;
     let socket = paths.socket.clone();
     let _shutdown_watch = platform::monitor_host_shutdown();
     // Adopt the holder's terminals before anyone can talk to us.
-    let core = Core::start(paths, info)?;
+    let owner_lock = if external_owner {
+        crate::paths::write_atomic(&paths.state.join("external-owner"), b"external-owner-v1\n")?;
+        Some(lock.try_clone()?)
+    } else {
+        None
+    };
+    let core = Core::start_owned(paths, info, owner_lock)?;
     let bound = AsyncListener::bind(&socket)?;
 
     tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async {
@@ -69,6 +100,9 @@ pub fn serve() -> io::Result<()> {
             }
         }
         platform::remove_endpoint(&socket);
+        if core.keeper_failed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(io::Error::other("native keeper lost; programs and outcomes retained, recovery held"));
+        }
         if core.restart.load(std::sync::atomic::Ordering::SeqCst) {
             core.handover();
         }
@@ -83,6 +117,16 @@ struct Identity {
     info: CoreInfo,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     machine_id: Option<String>,
+}
+
+/// Unlike ordinary startup, a handover must never create or reset an identity.
+pub(crate) fn handover_identity(bytes: &[u8], expected: &str) -> io::Result<CoreInfo> {
+    let saved: Identity = serde_json::from_slice(bytes).map_err(io::Error::other)?;
+    let machine = platform::machine_id();
+    if saved.info.id != expected || (saved.machine_id.is_some() && machine.is_some() && saved.machine_id != machine) {
+        return Err(io::Error::other("handover state identity does not match this core and machine"));
+    }
+    Ok(saved.info)
 }
 
 /// What a copy of another machine's disk must not bring along: that
@@ -295,6 +339,10 @@ async fn read_frames(core: &Arc<Core>, conn: &Arc<Conn>, read: &mut Reader) -> i
     // closes, or when it gives up on one (`$/cancelRequest`).
     let mut execs = Execs::default();
     while let Some((channel, kind, payload)) = wire::read_frame(read).await? {
+        if channel != 0 && core.keeper_failed.load(std::sync::atomic::Ordering::SeqCst) {
+            conn.with(|out| out.close(channel, b"keeper custody lost; input held"));
+            continue;
+        }
         if channel != 0 && crate::remote::relay_in(core, conn, channel, kind, &payload) {
             continue;
         }
@@ -396,6 +444,16 @@ async fn handle(
         let err = RpcError::invalid_request("missing method");
         return reply(rpc::response(request["id"].clone(), Err(err)));
     };
+    if core.keeper_failed.load(std::sync::atomic::Ordering::SeqCst) && !matches!(method, "hello" | "server.status") {
+        return reply(rpc::response(
+            request["id"].clone(),
+            Err(RpcError::new(
+                "unavailable",
+                "keeper custody lost; native owner retained",
+                "recover through the external owner; do not replay input",
+            )),
+        ));
+    }
     let call = api::Call { core, conn, plain };
     let params = crate::remote::from_peer(core, conn, request["params"].clone());
     let result = match crate::remote::route(core, method, &params) {

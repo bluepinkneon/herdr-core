@@ -2,6 +2,9 @@
 //! surface: connections, terminals, process trees, the console, files.
 //! Everything above it is shared.
 
+pub(crate) mod handover;
+pub(crate) mod keeper;
+
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]

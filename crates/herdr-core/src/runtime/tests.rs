@@ -32,6 +32,7 @@ fn a_new_holder_of_another_build_reports_both_identities() {
     let fake = std::thread::spawn(move || {
         assert_eq!(proto::read(&mut holder).unwrap().unwrap().0, proto::HELLO);
         let welcome = proto::Welcome {
+            keeper: None,
             version: proto::VERSION,
             instance: "other".into(),
             pid: 0,

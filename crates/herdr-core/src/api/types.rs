@@ -121,6 +121,8 @@ pub struct HelloResult {
 
 #[derive(Serialize, JsonSchema, Clone)]
 pub struct HolderInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keeper: Option<crate::keeper::KeeperInfo>,
     pub pid: u32,
     pub instance: String,
     /// Same build as the core: takes new terminals. Others drain.
@@ -131,6 +133,10 @@ pub struct HolderInfo {
 
 #[derive(Serialize, JsonSchema)]
 pub struct StatusResult {
+    /// Daemon restarts belong to the external OS owner, never a holder.
+    pub external_owner: bool,
+    /// False after a keeper link is lost; native admission is held while its owner stays alive.
+    pub keepers_ready: bool,
     pub core: CoreInfo,
     pub version: String,
     pub pid: u32,

@@ -18,6 +18,8 @@ use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{Notify, oneshot};
 
 pub struct Core {
+    pub(crate) owner_lock: Option<std::fs::File>,
+    pub(crate) keeper_failed: std::sync::atomic::AtomicBool,
     pub info: CoreInfo,
     pub started: Instant,
     pub stop: Notify,
@@ -93,6 +95,7 @@ pub struct State {
 }
 
 pub struct Link {
+    pub keeper: Option<crate::keeper::KeeperInfo>,
     /// Frames for the holder, written by their own thread: the core never
     /// blocks on the socket while holding its lock (the holder writes to us
     /// under its own lock; both waiting would freeze the session).
@@ -155,6 +158,14 @@ fn finish_reason(killed: bool, stopping: bool, host_shutdown: bool) -> &'static 
 
 impl Core {
     pub fn start(paths: Paths, info: CoreInfo) -> io::Result<Arc<Core>> {
+        Self::start_owned(paths, info, None)
+    }
+
+    pub(crate) fn start_owned(
+        paths: Paths,
+        info: CoreInfo,
+        owner_lock: Option<std::fs::File>,
+    ) -> io::Result<Arc<Core>> {
         let reg: Registry = read_state(&paths.state.join("terminals.json"))?;
         let docs_path = paths.state.join("docs.json");
         let docs = read_state(&docs_path).unwrap_or_else(|e| {
@@ -169,6 +180,8 @@ impl Core {
         let peers = read_state(&paths.state.join("peers.json"))?;
         let (jobs, jobs_rx) = tokio::sync::mpsc::unbounded_channel();
         let core = Arc::new(Core {
+            owner_lock,
+            keeper_failed: Default::default(),
             info,
             started: Instant::now(),
             stop: Notify::new(),
@@ -253,8 +266,18 @@ impl Core {
         // 8 hex: unique enough among one session's holders, and socket paths are short (macOS: 104 bytes).
         let socket =
             format!("{}{}.sock", self.holder_prefix(), &crate::platform::random_hex()[..crate::paths::HOLDER_ID]);
-        crate::client::spawn_detached(&self.paths, &["hold", "--socket", &socket], "holder.log")?;
+        let mut args = vec!["hold", "--socket", &socket];
+        if self.owner_lock.is_some() {
+            args.push("--external-owner");
+        }
+        crate::client::spawn_detached(&self.paths, &args, "holder.log")?;
         let stream = crate::client::wait_for_socket(socket.as_ref(), "holder").map_err(io::Error::other)?;
+        let stream = if let Some(lock) = &self.owner_lock {
+            drop(stream);
+            crate::keeper::connect(&self.paths, socket.as_ref(), lock)?
+        } else {
+            stream
+        };
         self.take_over(stream, true).map(drop)
     }
 
@@ -283,6 +306,10 @@ impl Core {
         sockets.sort();
         let mut adopted = HashSet::new();
         for socket in sockets {
+            if let Some(lock) = &self.owner_lock {
+                adopted.extend(self.take_over(crate::keeper::connect(&self.paths, &socket, lock)?, false)?);
+                continue;
+            }
             match platform::connect(&socket) {
                 Ok(stream) => adopted.extend(self.take_over(stream, false)?),
                 Err(_) => {
@@ -293,6 +320,9 @@ impl Core {
         let mut st = self.lock();
         let lost: Vec<u32> =
             st.reg.terminals.values().filter(|t| t.is_live() && !adopted.contains(&t.id())).map(|t| t.id()).collect();
+        if self.owner_lock.is_some() && !lost.is_empty() {
+            return Err(io::Error::other("external-owner holder custody incomplete; programs and records retained"));
+        }
         for id in lost {
             self.record_finish(&mut st, id, Exit { code: None, signal: None }, "stopped_by_restart");
         }
@@ -343,8 +373,15 @@ impl Core {
                 }
             }
         });
-        let link =
-            Link { writer, pid: welcome.pid, instance: welcome.instance.clone(), current, bye, bye_rx: Some(bye_rx) };
+        let link = Link {
+            keeper: welcome.keeper.clone(),
+            writer,
+            pid: welcome.pid,
+            instance: welcome.instance.clone(),
+            current,
+            bye,
+            bye_rx: Some(bye_rx),
+        };
         if !current {
             // Another build: it keeps what it runs, takes nothing new, exits when empty.
             link.send(&proto::frame(proto::DRAIN, 0, &[]));
@@ -541,6 +578,17 @@ impl Core {
         let mut st = self.lock();
         let Some(at) = st.holders.iter().position(|l| l.instance == instance) else { return };
         let link = st.holders.remove(at);
+        if let Some(keeper) = &link.keeper
+            && (!matches!(crate::keeper::retired(&self.paths, keeper), Ok(true))
+                || st.reg.terminals.values().any(|t| t.is_live() && t.holder.as_deref() == Some(instance.as_str())))
+        {
+            // A proxy loss proves neither holder death nor command settlement.
+            // Stop native admission without sweeping programs or rewriting history.
+            self.keeper_failed.store(true, std::sync::atomic::Ordering::SeqCst);
+            st.stopping = true;
+            self.changed.notify_waiters();
+            return;
+        }
         let theirs: Vec<u32> = st
             .reg
             .terminals

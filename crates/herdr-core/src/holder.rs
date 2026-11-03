@@ -51,7 +51,7 @@ struct Holder {
 }
 
 /// Runs a holder on `socket` (each holder has its own; the core picks the path).
-pub fn run(socket: std::path::PathBuf) -> io::Result<()> {
+pub fn run(socket: std::path::PathBuf, external_owner: bool) -> io::Result<()> {
     let paths = Paths::from_env().map_err(|e| io::Error::other(e.message))?;
     paths.create_dirs()?;
     // A taken path means another holder lives there; a stale file is removed by the core.
@@ -77,8 +77,10 @@ pub fn run(socket: std::path::PathBuf) -> io::Result<()> {
         draining: Default::default(),
         sweeps: Default::default(),
     });
-    let supervisor = holder.clone();
-    std::thread::spawn(move || supervisor.supervise());
+    if !external_owner {
+        let supervisor = holder.clone();
+        std::thread::spawn(move || supervisor.supervise());
+    }
     for stream in listener.incoming() {
         let holder = holder.clone();
         let stream = stream?;
@@ -170,6 +172,7 @@ impl Holder {
                         HeldTerminal { id: *id, pid: t.pid, cols: t.cols, rows: t.rows, exit: t.exit }
                     })
                     .collect(),
+                keeper: None,
             };
             let mut out = proto::json_frame(proto::WELCOME, 0, &welcome);
             for id in &ids {

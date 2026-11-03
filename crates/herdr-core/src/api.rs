@@ -193,6 +193,7 @@ async fn server_status(core: Ctx<'_>, _: Empty) -> Result<StatusResult, RpcError
         .holders
         .iter()
         .map(|l| HolderInfo {
+            keeper: l.keeper.clone(),
             pid: l.pid,
             instance: l.instance.clone(),
             current: l.current,
@@ -205,6 +206,8 @@ async fn server_status(core: Ctx<'_>, _: Empty) -> Result<StatusResult, RpcError
         })
         .collect();
     Ok(StatusResult {
+        external_owner: core.owner_lock.is_some(),
+        keepers_ready: !core.keeper_failed.load(std::sync::atomic::Ordering::SeqCst),
         core: core.info.clone(),
         version: version(),
         pid: std::process::id(),
@@ -455,6 +458,7 @@ async fn terminal_send(core: Ctx<'_>, p: SendParams) -> Result<SendResult, RpcEr
     } else {
         None
     };
+    core.input_custody(&core.lock(), true)?;
     Ok(SendResult { status: sent.status, turn: sent.turn, started: sent.started, wait })
 }
 

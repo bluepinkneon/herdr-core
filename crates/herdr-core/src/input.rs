@@ -106,6 +106,32 @@ pub enum Interrupted {
 }
 
 impl Core {
+    fn input_error(issued: bool) -> RpcError {
+        RpcError::new(
+            "unavailable",
+            "native input custody was lost",
+            if issued { "input outcome is unknown; do not replay" } else { "nothing was typed by this request" },
+        )
+    }
+
+    /// An accepted holder queue is not a PTY receipt. Loss after any write
+    /// leaves that request uncertain, including while it awaits a result.
+    pub(crate) fn input_custody(&self, st: &State, issued: bool) -> Result<(), RpcError> {
+        if st.stopping || self.keeper_failed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Self::input_error(issued));
+        }
+        Ok(())
+    }
+
+    fn write_input(&self, st: &State, id: u32, bytes: &[u8], issued: &mut bool) -> Result<(), RpcError> {
+        self.input_custody(st, *issued)?;
+        if !st.link(id).is_some_and(|link| link.try_input(id, bytes)) {
+            return Err(Self::input_error(*issued));
+        }
+        *issued |= !bytes.is_empty();
+        Ok(())
+    }
+
     /// Types `steps` (built by `prepare` from the live state) into terminal `id`.
     /// `quiet`: how long a person must have stopped typing first (zero: don't wait).
     pub async fn type_in<T>(
@@ -117,7 +143,11 @@ impl Core {
         let queue = self.lock().queues.entry(id).or_default().clone();
         let _turn = queue.lock().await;
         loop {
-            let left = self.lock().gates.get(&id).and_then(|g| g.last_human).map(|t| quiet.saturating_sub(t.elapsed()));
+            let left = {
+                let st = self.lock();
+                self.input_custody(&st, false)?;
+                st.gates.get(&id).and_then(|g| g.last_human).map(|t| quiet.saturating_sub(t.elapsed()))
+            };
             match left {
                 Some(left) if !left.is_zero() => tokio::time::sleep(left).await,
                 _ => break,
@@ -125,6 +155,7 @@ impl Core {
         }
         let (out, steps) = {
             let mut st = self.lock();
+            self.input_custody(&st, false)?;
             let t = st.reg.terminals.get(&id).filter(|t| t.is_live()).ok_or_else(|| {
                 RpcError::new(
                     "finished",
@@ -137,22 +168,24 @@ impl Core {
             st.gates.entry(id).or_default().busy = true;
             prepared
         };
-        for step in steps {
-            match step {
-                Step::Write(bytes) => {
-                    if let Some(link) = self.lock().link(id) {
-                        link.input(id, &bytes);
-                    }
+        let mut issued = false;
+        let result = async {
+            for step in steps {
+                match step {
+                    Step::Write(bytes) => self.write_input(&self.lock(), id, &bytes, &mut issued)?,
+                    Step::Pause(d) => tokio::time::sleep(d).await,
                 }
-                Step::Pause(d) => tokio::time::sleep(d).await,
             }
+            self.input_custody(&self.lock(), issued)
         }
+        .await;
         let mut st = self.lock();
-        let gate = st.gates.entry(id).or_default();
-        gate.busy = false;
-        let held = std::mem::take(&mut gate.held);
-        if let Some(link) = st.link(id) {
-            link.input(id, &held);
+        let held = st.gates.entry(id).or_default().set_busy(false);
+        // Release busy on every outcome. Never flush held bytes across lost
+        // custody or make a partially written sequence look successful.
+        result?;
+        if !held.is_empty() {
+            self.write_input(&st, id, &held, &mut issued)?;
         }
         Ok(out)
     }
@@ -215,6 +248,7 @@ impl Core {
         } else {
             None
         };
+        self.input_custody(&self.lock(), true)?;
         Ok(Sent { status, turn, started })
     }
 
@@ -287,6 +321,7 @@ impl Core {
             let settled = |st: &State| st.reg.terminals.get(&id).is_none_or(|t| !t.is_live() || !working(t));
             self.wait_for(timeout, settled).await;
             let st = self.lock();
+            self.input_custody(&st, true)?;
             let outcome = match st.reg.terminals.get(&id) {
                 Some(t) if !t.is_live() => Interrupted::Exited,
                 Some(t) if working(t) => Interrupted::StillWorking,
@@ -297,10 +332,13 @@ impl Core {
         // No status reports: a shell that gets the terminal back has stopped its job.
         let deadline = Instant::now() + timeout;
         loop {
+            self.input_custody(&self.lock(), true)?;
             if !live(&self.lock()) {
                 return Ok((Interrupted::Exited, key));
             }
-            if before != pid && self.foreground(id).await == pid {
+            let returned = before != pid && self.foreground(id).await == pid;
+            self.input_custody(&self.lock(), true)?;
+            if returned {
                 return Ok((Interrupted::Stopped, key));
             }
             if Instant::now() >= deadline {
